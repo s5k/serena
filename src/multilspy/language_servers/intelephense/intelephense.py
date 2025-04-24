@@ -43,7 +43,7 @@ class Intelephense(LanguageServer):
         # - vendor: third-party dependencies managed by Composer
         # - node_modules: if the project has JavaScript components
         # - cache: commonly used for caching
-        return super().is_ignored_dirname(dirname) or dirname in ["node_modules", "vendor", "cache"] 
+        return super().is_ignored_dirname(dirname) or dirname in ["packages", "node_modules", "cache", "build", "dist", "dev", "generated", "lib", "m2-hotfixes", "phpserver", "pub", "server", "var"] 
 
     def setup_runtime_dependencies(self, logger: MultilspyLogger, config: MultilspyConfig) -> str:
         """
