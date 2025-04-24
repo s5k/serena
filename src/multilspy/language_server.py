@@ -556,7 +556,10 @@ class LanguageServer:
                     new_item["range"] = item[LSPConstants.TARGET_SELECTION_RANGE]
                     ret.append(multilspy_types.Location(**new_item))
                 else:
-                    assert False, f"Unexpected response from Language Server: {item}"
+                    # assert False, f"Unexpected response from Language Server: {item}"
+                    # Skip items with unexpected format
+                    self.logger.log(f"Skipping item with unexpected format: {item}", logging.WARNING)
+                    continue
         elif isinstance(response, dict):
             # response is of type Location
             assert LSPConstants.URI in response
@@ -574,9 +577,11 @@ class LanguageServer:
                 f"Language server returned None for definition request at {relative_file_path}:{line}:{column}",
                 logging.WARNING,
             )
+        elif response is None:
+            self.logger.log(f"No response from Language Server", logging.WARNING)
+            return ret
         else:
             assert False, f"Unexpected response from Language Server: {response}"
-
         return ret
 
     # Some LS cause problems with this, so the call is isolated from the rest to allow overriding in subclasses
@@ -627,7 +632,11 @@ class LanguageServer:
             return []
 
         ret: List[multilspy_types.Location] = []
-        assert isinstance(response, list), f"Unexpected response from Language Server (expected list, got {type(response)}): {response}"
+        # Handle case where response is None
+        if response is None:
+            self.logger.log(f"No response from Language Server", logging.WARNING)
+            return ret
+        assert isinstance(response, list), f"Unexpected response from Language Server: {response}"
         for item in response:
             assert isinstance(item, dict), f"Unexpected response from Language Server (expected dict, got {type(item)}): {item}"
             assert LSPConstants.URI in item
@@ -861,6 +870,10 @@ class LanguageServer:
             item[LSPConstants.CHILDREN] = item.get(LSPConstants.CHILDREN, [])
 
         flat_all_symbol_list: List[multilspy_types.UnifiedSymbolInformation] = []
+        # Handle case where response is None
+        if response is None:
+            self.logger.log(f"No response from Language Server for document symbols request", logging.WARNING)
+            return ([], [])
         assert isinstance(response, list), f"Unexpected response from Language Server: {response}"
         root_nodes: List[multilspy_types.UnifiedSymbolInformation] = []
         for item in response:
@@ -976,6 +989,7 @@ class LanguageServer:
                     # TODO: Not sure if this is actually still needed given recent changes to relative path handling
                     def fix_relative_path(nodes: List[multilspy_types.UnifiedSymbolInformation]):
                         for node in nodes:
+                            # Check if location and relativePath exist before trying to access them
                             if "location" in node and "relativePath" in node["location"]:
                                 path = Path(node["location"]["relativePath"])
                                 if path.is_absolute():
