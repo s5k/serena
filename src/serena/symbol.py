@@ -1,15 +1,18 @@
+import json
 import logging
 import os
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Dict, Self, Tuple
 
 from sensai.util.string import ToStringMixin
 
 from multilspy import SyncLanguageServer
 from multilspy.multilspy_types import Position, SymbolKind, UnifiedSymbolInformation
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .agent import SerenaAgent
@@ -73,7 +76,9 @@ class Symbol(ToStringMixin):
 
     @property
     def relative_path(self) -> str | None:
-        return self.s["location"]["relativePath"]
+        if "location" in self.s and "relativePath" in self.s["location"]:
+            return self.s["location"]["relativePath"]
+        return None
 
     @property
     def location(self) -> SymbolLocation:
@@ -111,6 +116,9 @@ class Symbol(ToStringMixin):
         return self.s.get("body")
 
     def iter_children(self) -> Iterator["Symbol"]:
+        if "children" not in self.s:
+            return []
+
         for c in self.s["children"]:
             yield Symbol(c)
 
@@ -190,6 +198,7 @@ class Symbol(ToStringMixin):
         return result
 
 
+
 class SymbolManager:
     def __init__(self, lang_server: SyncLanguageServer, agent: "SerenaAgent") -> None:
         self.lang_server = lang_server
@@ -227,11 +236,15 @@ class SymbolManager:
         :return: a list of symbols that match the given name
         """
         symbols: list[Symbol] = []
-        symbol_roots = self.lang_server.request_full_symbol_tree(within_relative_path=within_relative_path, include_body=include_body)
-        for root in symbol_roots:
-            symbols.extend(
-                Symbol(root).find(name, include_kinds=include_kinds, exclude_kinds=exclude_kinds, substring_matching=substring_matching)
-            )
+        
+        workspace_symbols = self.lang_server.request_workspace_symbol(name)
+        for symbol in workspace_symbols:
+            symbol_roots = self.lang_server.request_full_symbol_tree(within_relative_path=symbol["location"]["relativePath"], include_body=include_body)
+            for root in symbol_roots:
+                symbols.extend(
+                    Symbol(root).find(name, include_kinds=include_kinds, exclude_kinds=exclude_kinds, substring_matching=substring_matching)
+                )
+
         return symbols
 
     def get_document_symbols(self, relative_path: str) -> list[Symbol]:
@@ -378,3 +391,4 @@ class SymbolManager:
             start_pos = Position(line=start_line, character=0)
             end_pos = Position(line=end_line + 1, character=0)
             self.lang_server.delete_text_between_positions(relative_path, start_pos, end_pos)
+
