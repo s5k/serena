@@ -67,7 +67,7 @@ class Language(str, Enum):
             case self.DART:
                 return FilenameMatcher("*.dart")
             case self.PHP:
-                return FilenameMatcher("*.php")
+                return FilenameMatcher("*.php", "*.phtml")
             case _:
                 raise ValueError(f"Unhandled language: {self}")
 

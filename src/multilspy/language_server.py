@@ -38,6 +38,7 @@ from .lsp_protocol_handler.server import (
 from .multilspy_config import Language, MultilspyConfig
 from .multilspy_exceptions import MultilspyException
 from .multilspy_utils import PathUtils, FileUtils, TextUtils
+from .uri_path_mapper import UriPathMapper
 from pathlib import PurePath
 from typing import AsyncIterator, Iterator, List, Dict, Optional, Union, Tuple
 from .multilspy_logger import MultilspyLogger
@@ -189,9 +190,13 @@ class LanguageServer:
 
             return ClangdLanguageServer(config, logger, repository_root_path)
         elif config.code_language == Language.PHP:
-            from multilspy.language_servers.intelephense.intelephense import Intelephense
+            # PHPActor LSP
+            from multilspy.language_servers.phpactor.phpactor import PHPActor
+            return PHPActor(config, logger, repository_root_path)
 
-            return Intelephense(config, logger, repository_root_path)
+            # Intelephense LSP
+            # from multilspy.language_servers.intelephense.intelephense import Intelephense
+            # return Intelephense(config, logger, repository_root_path)
         else:
             logger.log(f"Language {config.code_language} is not supported", logging.ERROR)
             raise MultilspyException(f"Language {config.code_language} is not supported")
@@ -254,6 +259,9 @@ class LanguageServer:
         self.load_cache()
         self._cache_has_changed = bool
         self.language = Language(language_id)
+        
+        # Create the URI-to-Path mapper with caching
+        self._path_mapper = UriPathMapper(self.repository_root_path, self.logger)
 
         # Set up the pathspec matcher for the ignored paths
         # for all absolute paths in ignored_paths, convert them to relative paths
@@ -538,43 +546,41 @@ class LanguageServer:
             )
 
         ret: List[multilspy_types.Location] = []
+        
         if isinstance(response, list):
             # response is either of type Location[] or LocationLink[]
             for item in response:
                 assert isinstance(item, dict)
                 if LSPConstants.URI in item and LSPConstants.RANGE in item:
-                    new_item: multilspy_types.Location = {}
-                    new_item.update(item)
-                    new_item["absolutePath"] = PathUtils.uri_to_path(new_item["uri"])
-                    new_item["relativePath"] = PathUtils.get_relative_path(new_item["absolutePath"], self.repository_root_path)
-                    ret.append(multilspy_types.Location(new_item))
+                    # Standard Location object
+                    enriched_location = self._path_mapper.enrich_location(item)
+                    ret.append(multilspy_types.Location(**enriched_location))
                 elif (
                     LSPConstants.ORIGIN_SELECTION_RANGE in item
                     and LSPConstants.TARGET_URI in item
                     and LSPConstants.TARGET_RANGE in item
                     and LSPConstants.TARGET_SELECTION_RANGE in item
                 ):
-                    new_item: multilspy_types.Location = {}
-                    new_item["uri"] = item[LSPConstants.TARGET_URI]
-                    new_item["absolutePath"] = PathUtils.uri_to_path(new_item["uri"])
-                    new_item["relativePath"] = PathUtils.get_relative_path(new_item["absolutePath"], self.repository_root_path)
-                    new_item["range"] = item[LSPConstants.TARGET_SELECTION_RANGE]
-                    ret.append(multilspy_types.Location(**new_item))
+                    # LocationLink object
+                    new_item = {
+                        "uri": item[LSPConstants.TARGET_URI],
+                        "range": item[LSPConstants.TARGET_SELECTION_RANGE]
+                    }
+                    enriched_location = self._path_mapper.enrich_location(new_item)
+                    ret.append(multilspy_types.Location(**enriched_location))
                 else:
-                    # assert False, f"Unexpected response from Language Server: {item}"
                     # Skip items with unexpected format
                     self.logger.log(f"Skipping item with unexpected format: {item}", logging.WARNING)
                     continue
+                    
         elif isinstance(response, dict):
             # response is of type Location
             assert LSPConstants.URI in response
             assert LSPConstants.RANGE in response
-
-            new_item: multilspy_types.Location = {}
-            new_item.update(response)
-            new_item["absolutePath"] = PathUtils.uri_to_path(new_item["uri"])
-            new_item["relativePath"] = PathUtils.get_relative_path(new_item["absolutePath"], self.repository_root_path)
-            ret.append(multilspy_types.Location(**new_item))
+            
+            enriched_location = self._path_mapper.enrich_location(response)
+            ret.append(multilspy_types.Location(**enriched_location))
+            
         elif response is None:
             # Some language servers return None when they cannot find a definition
             # This is expected for certain symbol types like generics or types with incomplete information
@@ -582,11 +588,9 @@ class LanguageServer:
                 f"Language server returned None for definition request at {relative_file_path}:{line}:{column}",
                 logging.WARNING,
             )
-        elif response is None:
-            self.logger.log(f"No response from Language Server", logging.WARNING)
-            return ret
         else:
             assert False, f"Unexpected response from Language Server: {response}"
+            
         return ret
 
     async def request_references(
@@ -611,7 +615,6 @@ class LanguageServer:
             )
             raise MultilspyException("Language Server not started")
 
-
         with self.open_file(relative_file_path):
             # sending request to the language server and waiting for response
             response = await self.server.send.references(
@@ -629,23 +632,23 @@ class LanguageServer:
         if response is None:
             self.logger.log(f"No response from Language Server", logging.WARNING)
             return ret
+            
         assert isinstance(response, list), f"Unexpected response from Language Server: {response}"
+        
         for item in response:
             assert isinstance(item, dict)
             assert LSPConstants.URI in item
             assert LSPConstants.RANGE in item
 
-            abs_path = PathUtils.uri_to_path(item[LSPConstants.URI])
-            rel_path = Path(abs_path).relative_to(self.repository_root_path)
-            if self.is_ignored_path(str(rel_path)):
-                self.logger.log(f"Ignoring reference in {rel_path} since it should be ignored", logging.DEBUG)
+            # Use the UriPathMapper to get the relative path
+            enriched_location = self._path_mapper.enrich_location(item)
+            
+            # Check if the path should be ignored
+            if "relativePath" in enriched_location and self.is_ignored_path(enriched_location["relativePath"]):
+                self.logger.log(f"Ignoring reference in {enriched_location['relativePath']} since it should be ignored", logging.DEBUG)
                 continue
 
-            new_item: multilspy_types.Location = {}
-            new_item.update(item)
-            new_item["absolutePath"] = str(abs_path)
-            new_item["relativePath"] = str(rel_path)
-            ret.append(multilspy_types.Location(**new_item))
+            ret.append(multilspy_types.Location(**enriched_location))
 
         return ret
 
@@ -832,70 +835,57 @@ class LanguageServer:
                 }
             )
 
-        def turn_item_into_symbol_with_children(item: GenericDocumentSymbol):
-            item = cast(multilspy_types.UnifiedSymbolInformation, item)
-            absolute_path = os.path.join(self.repository_root_path, relative_file_path)
-            
-            # handle missing entries in location
-            if "location" not in item:
-                uri = pathlib.Path(absolute_path).as_uri()
-                assert "range" in item
-                tree_location = multilspy_types.Location(
-                    uri=uri,
-                    range=item['range'],
-                    absolutePath=absolute_path,
-                    relativePath=relative_file_path,
-                )
-                item['location'] = tree_location
-            location = item["location"]
-            if "absolutePath" not in location:
-                location["absolutePath"] = absolute_path
-            if "relativePath" not in location:
-                location["relativePath"] = relative_file_path
-            if include_body:
-                item['body'] = self.retrieve_symbol_body(item)
-            # handle missing selectionRange
-            if "selectionRange" not in item:
-                if "range" in item:
-                    item["selectionRange"] = item["range"]
-                else:
-                    item["selectionRange"] = item["location"]["range"]
-            item[LSPConstants.CHILDREN] = item.get(LSPConstants.CHILDREN, [])
-
-        flat_all_symbol_list: List[multilspy_types.UnifiedSymbolInformation] = []
         # Handle case where response is None
         if response is None:
             self.logger.log(f"No response from Language Server for document symbols request", logging.WARNING)
             return ([], [])
+            
         assert isinstance(response, list), f"Unexpected response from Language Server: {response}"
-        root_nodes: List[multilspy_types.UnifiedSymbolInformation] = []
+        
+        # Transform the response to add path information
+        enriched_response = []
         for item in response:
-            if "range" not in item and "location" not in item:
-                if item["kind"] in [SymbolKind.File, SymbolKind.Module]:
-                    ...
-
-            turn_item_into_symbol_with_children(item)
+            # Process the symbol using our UriPathMapper
+            enriched_item = self._path_mapper.enrich_symbol(item, default_relative_path=relative_file_path)
+            
+            # Handle missing selectionRange which our mapper doesn't handle
+            if "selectionRange" not in enriched_item:
+                if "range" in enriched_item:
+                    enriched_item["selectionRange"] = enriched_item["range"]
+                elif "location" in enriched_item and "range" in enriched_item["location"]:
+                    enriched_item["selectionRange"] = enriched_item["location"]["range"]
+                    
+            # Ensure children attribute is present
+            enriched_item[LSPConstants.CHILDREN] = enriched_item.get(LSPConstants.CHILDREN, [])
+            
+            # Add body if requested
+            if include_body and "location" in enriched_item and "relativePath" in enriched_item["location"]:
+                enriched_item['body'] = self.retrieve_symbol_body(enriched_item)
+                
+            enriched_response.append(enriched_item)
+            
+        # Build result with the same structure as before
+        flat_all_symbol_list: List[multilspy_types.UnifiedSymbolInformation] = []
+        root_nodes: List[multilspy_types.UnifiedSymbolInformation] = []
+        
+        for item in enriched_response:
             item = cast(multilspy_types.UnifiedSymbolInformation, item)
             root_nodes.append(item)
-            assert isinstance(item, dict)
-            assert LSPConstants.NAME in item
-            assert LSPConstants.KIND in item
-
-            if LSPConstants.CHILDREN in item:
-                # TODO: l_tree should be a list of TreeRepr. Define the following function to return TreeRepr as well
-                
-                def visit_tree_nodes_and_build_tree_repr(node: GenericDocumentSymbol) -> List[multilspy_types.UnifiedSymbolInformation]:
+            
+            # Add to flat list
+            if LSPConstants.CHILDREN in item and item[LSPConstants.CHILDREN]:
+                # Build flat list by traversing the tree
+                def visit_tree_nodes_and_build_flat_list(node: GenericDocumentSymbol) -> List[multilspy_types.UnifiedSymbolInformation]:
                     node = cast(multilspy_types.UnifiedSymbolInformation, node)
-                    l: List[multilspy_types.UnifiedSymbolInformation] = []
-                    turn_item_into_symbol_with_children(node)
-                    assert LSPConstants.CHILDREN in node
-                    children = node[LSPConstants.CHILDREN]
-                    l.append(node)
-                    for child in children:
-                        l.extend(visit_tree_nodes_and_build_tree_repr(child))
-                    return l
+                    result_list: List[multilspy_types.UnifiedSymbolInformation] = [node]
+                    
+                    if LSPConstants.CHILDREN in node:
+                        for child in node[LSPConstants.CHILDREN]:
+                            result_list.extend(visit_tree_nodes_and_build_flat_list(child))
+                            
+                    return result_list
                 
-                flat_all_symbol_list.extend(visit_tree_nodes_and_build_tree_repr(item))
+                flat_all_symbol_list.extend(visit_tree_nodes_and_build_flat_list(item))
             else:
                 flat_all_symbol_list.append(multilspy_types.UnifiedSymbolInformation(**item))
 
@@ -1607,15 +1597,17 @@ class LanguageServer:
 
         assert isinstance(response, list)
 
+        # Transform the response using our UriPathMapper to ensure relativePath information
         ret: List[multilspy_types.UnifiedSymbolInformation] = []
         for item in response:
             assert isinstance(item, dict)
-
             assert LSPConstants.NAME in item
             assert LSPConstants.KIND in item
             assert LSPConstants.LOCATION in item
 
-            ret.append(multilspy_types.UnifiedSymbolInformation(**item))
+            # Enrich the item with path information
+            enriched_item = self._path_mapper.enrich_symbol(item)
+            ret.append(multilspy_types.UnifiedSymbolInformation(**enriched_item))
 
         return ret
 
