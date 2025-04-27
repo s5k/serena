@@ -879,6 +879,13 @@ class GetDiagnosticsTool(Tool):
                 relative_path=relative_file_path,
                 severity_levels=severity_levels
             )
+
+            if not result_diagnostics:
+                if severity_levels:
+                    return f"No diagnostics found for file '{relative_file_path}' with severities {severity_levels}."
+                else:
+                    return f"No diagnostics found for file '{relative_file_path}' (all severities checked)."
+
             result = json.dumps(result_diagnostics)
             return self._limit_length(result, max_answer_chars)
 
