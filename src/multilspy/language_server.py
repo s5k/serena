@@ -19,7 +19,7 @@ import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from copy import copy
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from fnmatch import fnmatch
 from pathlib import Path, PurePath
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union, cast
@@ -30,7 +30,7 @@ from serena.text_utils import LineType, MatchedConsecutiveLines, TextLine, searc
 from . import multilspy_types
 from .lsp_protocol_handler import lsp_types as LSPTypes
 from .lsp_protocol_handler.lsp_constants import LSPConstants
-from .lsp_protocol_handler.lsp_types import SymbolKind
+from .lsp_protocol_handler.lsp_types import Diagnostic, SymbolKind
 from .lsp_protocol_handler.server import (
     LanguageServerHandler,
     ProcessLaunchInfo,
@@ -44,6 +44,7 @@ from typing import AsyncIterator, Iterator, List, Dict, Optional, Union, Tuple
 from .multilspy_logger import MultilspyLogger
 from .multilspy_utils import FileUtils, PathUtils, TextUtils
 from .type_helpers import ensure_all_methods_implemented
+from multilspy.lsp_protocol_handler import lsp_types
 
 # Serena dependencies
 # We will need to watch out for circular imports, but it's probably better to not
@@ -227,6 +228,7 @@ class LanguageServer:
         self.server_started = False
         self.repository_root_path: str = repository_root_path
         self.completions_available = asyncio.Event()
+        self._diagnostics_store: Dict[str, List[Diagnostic]] = {}
 
         if config.trace_lsp_communication:
 
@@ -277,6 +279,57 @@ class LanguageServer:
             pathspec.patterns.GitWildMatchPattern,
             processed_patterns
         )
+
+    def handle_publish_diagnostics(self, params: Dict[str, Any]) -> None:
+        """
+        Handle textDocument/publishDiagnostics notifications from the language server
+        
+        :param params: The notification parameters
+        """
+        try:
+            uri = params.get("uri", "")
+            diagnostics = params.get("diagnostics", [])
+            
+            # Convert URI to relative path
+            import urllib.parse
+            from pathlib import Path
+            
+            uri_path = urllib.parse.unquote(uri.replace("file://", ""))
+            repo_root = self.repository_root_path
+            
+            # Handle potential path differences between URI and repo root
+            try:
+                relative_path = os.path.relpath(uri_path, repo_root)
+                # Store the diagnostics
+                self._diagnostics_store[relative_path] = diagnostics
+                self.logger.log(f"Stored {len(diagnostics)} diagnostics for {relative_path}", logging.INFO)
+            except ValueError:
+                self.logger.log(f"URI path {uri_path} is not relative to repo root {repo_root}", logging.INFO)
+        except Exception as e:
+            self.logger.log(f"Error handling diagnostics notification: {e}", logging.INFO)
+
+    def get_diagnostics_for_file(self, relative_path: str) -> List[Diagnostic]:
+        """
+        Get diagnostics (errors and warnings) for a specific file
+        
+        :param relative_path: The relative path to the file
+        :return: List of diagnostics for the file
+        """
+        return self._diagnostics_store.get(relative_path, [])
+
+    def get_diagnostics_by_severity(self, relative_path: str, severity_levels: Optional[List[int]]) -> List[Diagnostic]:
+        """
+        Get diagnostics with a specific severity for a file.
+
+        :param relative_path: The relative path to the file.
+        :param severity_levels: A list of severity levels (1=Error, 2=Warning, 3=Info, 4=Hint).
+        :return: List of diagnostics with the specified severity.
+        """
+        all_diagnostics = self.get_diagnostics_for_file(relative_path)
+        if severity_levels is None:
+            return all_diagnostics
+
+        return [d for d in all_diagnostics if d.get("severity") in severity_levels]
 
     def get_ignore_spec(self) -> pathspec.PathSpec:
         """Returns the pathspec matcher for the paths that were configured to be ignored through
@@ -1577,6 +1630,90 @@ class LanguageServer:
                         logging.ERROR
                     )
 
+    async def request_document_diagnostic(
+        self, 
+        relative_file_path: str, 
+    ) -> Union[lsp_types.DocumentDiagnosticReport, None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :return: List of RelatedFullDocumentDiagnosticReport or RelatedUnchangedDocumentDiagnosticReport
+        """
+        if not self.server_started:
+            self.logger.log(
+                "request_code_action called before Language Server started",
+                loglevel=logging.WARNING,
+            )
+            return None
+
+        with self.open_file(relative_file_path):
+            code_action_params = lsp_types.DocumentDiagnosticParams(
+                textDocument=lsp_types.TextDocumentIdentifier(
+                    uri=pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()
+                ),
+            )
+            response = await self.server.send.text_document_diagnostic(code_action_params)
+        
+        if response is None:
+            return None
+            
+        return response
+
+    async def request_code_action(
+        self, 
+        relative_file_path: str, 
+        start_line: int, 
+        start_column: int,
+        end_line: int, 
+        end_column: int,
+        diagnostics: List[lsp_types.Diagnostic] = None
+    ) -> Union[List[Union[lsp_types.Command, lsp_types.CodeAction]], None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :param start_line: The 0-indexed start line number of the range
+        :param start_column: The 0-indexed start column number of the range
+        :param end_line: The 0-indexed end line number of the range
+        :param end_column: The 0-indexed end column number of the range
+        :param diagnostics: Optional list of diagnostics to include in the code action context
+        :return: List of commands or code actions, or None if no actions are available
+        """
+        if not self.server_started:
+            self.logger.log(
+                "request_code_action called before Language Server started",
+                loglevel=logging.WARNING,
+            )
+            return None
+
+        with self.open_file(relative_file_path):
+            code_action_params = lsp_types.CodeActionParams(
+                textDocument=lsp_types.TextDocumentIdentifier(
+                    uri=pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()
+                ),
+                range=lsp_types.Range(
+                    start=lsp_types.Position(line=start_line, character=start_column),
+                    end=lsp_types.Position(line=end_line, character=end_column)
+                ),
+                context=lsp_types.CodeActionContext(
+                    diagnostics=[]
+                    # diagnostics=[lsp_types.Diagnostic(
+                    #     range=lsp_types.Range(
+                    #         start=lsp_types.Position(line=start_line, character=start_column),
+                    #         end=lsp_types.Position(line=end_line, character=end_column)
+                    #     ),
+                    #     severity=1
+                    # )]
+                )
+            )
+            
+            response = await self.server.send.code_action(code_action_params)
+        
+        if response is None:
+            return None
+            
+        return response
 
     async def request_workspace_symbol(self, query: str) -> Union[List[multilspy_types.UnifiedSymbolInformation], None]:
         """
@@ -1860,6 +1997,60 @@ class SyncLanguageServer:
         ).result(timeout=self.timeout)
         return result
 
+    def request_document_diagnostic(
+        self, 
+        relative_file_path: str, 
+    ) -> Union[List[lsp_types.DocumentDiagnosticReport], None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :return: List of RelatedFullDocumentDiagnosticReport or RelatedUnchangedDocumentDiagnosticReport
+        """
+        assert self.loop
+        result = asyncio.run_coroutine_threadsafe(
+            self.language_server.request_document_diagnostic(
+                relative_file_path=relative_file_path,
+            ),
+            self.loop
+        ).result(timeout=self.timeout)
+        return result
+
+
+    def request_code_action(
+        self, 
+        relative_file_path: str, 
+        start_line: int, 
+        start_column: int,
+        end_line: int, 
+        end_column: int,
+        diagnostics: List[lsp_types.Diagnostic] = None
+    ) -> Union[List[Union[lsp_types.Command, lsp_types.CodeAction]], None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :param start_line: The 0-indexed start line number of the range
+        :param start_column: The 0-indexed start column number of the range
+        :param end_line: The 0-indexed end line number of the range
+        :param end_column: The 0-indexed end column number of the range
+        :param diagnostics: Optional list of diagnostics to include in the code action context
+        :return: List of commands or code actions, or None if no actions are available
+        """
+        assert self.loop
+        result = asyncio.run_coroutine_threadsafe(
+            self.language_server.request_code_action(
+                relative_file_path=relative_file_path,
+                start_line=start_line,
+                start_column=start_column,
+                end_line=end_line,
+                end_column=end_column,
+                diagnostics=diagnostics
+            ),
+            self.loop
+        ).result(timeout=self.timeout)
+        return result
+
     def request_workspace_symbol(self, query: str) -> Union[List[multilspy_types.UnifiedSymbolInformation], None]:
         """
         Raise a [workspace/symbol](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_symbol) request to the Language Server
@@ -2121,3 +2312,30 @@ class SyncLanguageServer:
         such as when searching for relevant non-language files in the project.
         """
         return self.language_server.get_ignore_spec()
+
+    def handle_publish_diagnostics(self, params: Dict[str, Any]) -> None:
+        """
+        Handle textDocument/publishDiagnostics notifications from the language server
+        
+        :param params: The notification parameters
+        """
+        return self.language_server.handle_publish_diagnostics(params)
+
+    def get_diagnostics_for_file(self, relative_path: str) -> List[Diagnostic]:
+        """
+        Get diagnostics (errors and warnings) for a specific file
+        
+        :param relative_path: The relative path to the file
+        :return: List of diagnostics for the file
+        """
+        return self.language_server.get_diagnostics_for_file(relative_path)
+
+    def get_diagnostics_by_severity(self, relative_path: str, severity_levels: Optional[List[int]]) -> List[Diagnostic]:
+        """
+        Get diagnostics with a specific severity for a file
+        
+        :param relative_path: The relative path to the file
+        :param severity_levels: The severity level (1=Error, 2=Warning, 3=Info, 4=Hint)
+        :return: List of diagnostics with the specified severity
+        """
+        return self.language_server.get_diagnostics_by_severity(relative_path, severity_levels)

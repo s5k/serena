@@ -109,10 +109,7 @@
                 "relatedInformation": true,
                 "versionSupport": false,
                 "tagSupport": {
-                    "valueSet": [
-                        1,
-                        2
-                    ]
+                "valueSet": [1, 2]
                 },
                 "codeDescriptionSupport": true,
                 "dataSupport": true
@@ -122,6 +119,10 @@
                 "willSave": true,
                 "willSaveWaitUntil": true,
                 "didSave": true
+            },
+            "diagnostic": {
+                "dynamicRegistration": true,
+                "relatedDocumentSupport": false
             },
             "completion": {
                 "dynamicRegistration": true,
@@ -422,10 +423,6 @@
                         "label.command"
                     ]
                 }
-            },
-            "diagnostic": {
-                "dynamicRegistration": true,
-                "relatedDocumentSupport": false
             }
         },
         "general": {
