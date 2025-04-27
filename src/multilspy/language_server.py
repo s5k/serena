@@ -188,13 +188,9 @@ class LanguageServer:
 
             return ClangdLanguageServer(config, logger, repository_root_path)
         elif config.code_language == Language.PHP:
-            # PHPActor LSP
-            from multilspy.language_servers.phpactor.phpactor import PHPActor
-            return PHPActor(config, logger, repository_root_path)
+            from multilspy.language_servers.intelephense.intelephense import Intelephense
 
-            # Intelephense LSP
-            # from multilspy.language_servers.intelephense.intelephense import Intelephense
-            # return Intelephense(config, logger, repository_root_path)
+            return Intelephense(config, logger, repository_root_path)
         else:
             logger.log(f"Language {config.code_language} is not supported", logging.ERROR)
             raise MultilspyException(f"Language {config.code_language} is not supported")
