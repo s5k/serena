@@ -1,0 +1,18 @@
+{
+  "_description": "The parameters sent by the client when initializing the language server with the \"initialize\" request. More details at https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialize",
+  "processId": "os.getpid()",
+  "clientInfo": {
+    "name": "Serena",
+    "version": "1.0.0"
+  },
+  "locale": "en",
+  "rootPath": "$rootPath",
+  "rootUri": "$rootUri",
+  "capabilities": {},
+  "workspaceFolders": [
+    {
+      "uri": "$uri",
+      "name": "$name"
+    }
+  ]
+}
