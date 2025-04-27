@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import sys
+import time
 import traceback
 from abc import ABC
 from collections import defaultdict
@@ -14,7 +15,7 @@ from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass, field
 from logging import Logger
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, List, Optional, Self, TypeVar, Union, cast
 
 import yaml
 from sensai.util import logging
@@ -22,6 +23,7 @@ from sensai.util.logging import FallbackHandler
 from sensai.util.string import ToStringMixin, dict_string
 
 from multilspy import SyncLanguageServer
+from multilspy.lsp_protocol_handler import lsp_types
 from multilspy.multilspy_config import Language, MultilspyConfig
 from multilspy.multilspy_logger import MultilspyLogger
 from multilspy.multilspy_types import SymbolKind
@@ -291,7 +293,6 @@ class SerenaAgent:
         self.symbol_manager: SymbolManager | None = None
         self.memories_manager: MemoriesManager | None = None
         self.lines_read: LinesRead | None = None
-
         # find all tool classes and instantiate them
         self._all_tools: dict[type[Tool], Tool] = {}
         for tool_class in iter_tool_classes():
@@ -368,7 +369,6 @@ class SerenaAgent:
         self.symbol_manager = SymbolManager(self.language_server, self)
         self.memories_manager = MemoriesManager(os.path.join(self.project_config.get_serena_managed_dir(), "memories"))
         self.lines_read = LinesRead()
-
         if self._project_activation_callback is not None:
             self._project_activation_callback()
 
@@ -836,6 +836,51 @@ class FindSymbolTool(Tool):
         symbol_dicts = [s.to_dict(kind=True, location=True, depth=depth, include_body=include_body) for s in symbols]
         result = json.dumps(symbol_dicts)
         return self._limit_length(result, max_answer_chars)
+
+class GetDiagnosticsTool(Tool):
+    """
+    A tool for retrieving diagnostics information (e.g., errors, warnings) for a given file.
+
+    Performs a static analysis on the specified file path and returns a list of diagnostics,
+    such as syntax errors, type issues, and other code problems. Useful for identifying issues
+    prior to code edits or further analysis.
+    """
+
+    def apply(
+        self,
+        relative_file_path: str, 
+        severity_levels: Optional[List[int]],
+        max_answer_chars: int = _DEFAULT_MAX_ANSWER_LENGTH,
+    ) -> str:
+        """
+        Fetches diagnostics for a file and returns the results as a JSON string.
+
+        This method analyzes the specified file and gathers a list of diagnostic messages
+        (e.g., errors, warnings). The resulting diagnostics data can be used for informing
+        code modifications or for feeding into downstream tools. If the result exceeds
+        `max_answer_chars`, it is truncated.
+
+        :param relative_file_path: The relative path to the file
+        :param severity_levels: The severity level (1=Error, 2=Warning, 3=Info, 4=Hint)
+        :param max_answer_chars: Maximum number of characters allowed
+        :return: List of diagnostics for the file
+        """
+        with self.language_server.open_file(relative_file_path=relative_file_path):
+            self.language_server.insert_text_at_position(relative_file_path=relative_file_path, line=0, column=0, text_to_be_inserted="")
+            self.language_server.delete_text_between_positions(
+                relative_file_path=relative_file_path, 
+                start={"line": 0, "character": 0}, 
+                end={"line": 0, "character": 0}
+            )
+
+            time.sleep(2.5)
+
+            result_diagnostics = self.language_server.get_diagnostics_by_severity(
+                relative_path=relative_file_path,
+                severity_levels=severity_levels
+            )
+            result = json.dumps(result_diagnostics)
+            return self._limit_length(result, max_answer_chars)
 
 
 class FindReferencingSymbolsTool(Tool):

@@ -9,6 +9,27 @@
   "rootPath": "$rootPath",
   "rootUri": "$rootUri",
   "capabilities": {
+    "textDocument": {
+      "publishDiagnostics": {
+        "relatedInformation": true,
+        "versionSupport": false,
+        "tagSupport": {
+          "valueSet": [1, 2]
+        },
+        "codeDescriptionSupport": true,
+        "dataSupport": true
+      },
+      "synchronization": {
+        "dynamicRegistration": true,
+        "willSave": true,
+        "willSaveWaitUntil": true,
+        "didSave": true
+      },
+      "diagnostic": {
+        "dynamicRegistration": true,
+        "relatedDocumentSupport": false
+      }
+    },
     "textDocumentSync": 2,
     "documentSymbolProvider": true,
     "workspaceSymbolProvider": true,
