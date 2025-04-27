@@ -236,14 +236,21 @@ class SymbolManager:
         :return: a list of symbols that match the given name
         """
         symbols: list[Symbol] = []
-        
-        workspace_symbols = self.lang_server.request_workspace_symbol(name)
-        for symbol in workspace_symbols:
-            symbol_roots = self.lang_server.request_full_symbol_tree(within_relative_path=symbol["location"]["relativePath"], include_body=include_body)
+
+        if within_relative_path is not None:
+            symbol_roots = self.lang_server.request_full_symbol_tree(within_relative_path=within_relative_path, include_body=include_body)
             for root in symbol_roots:
                 symbols.extend(
                     Symbol(root).find(name, include_kinds=include_kinds, exclude_kinds=exclude_kinds, substring_matching=substring_matching)
                 )
+        else: 
+            workspace_symbols = self.lang_server.request_workspace_symbol(name)
+            for symbol in workspace_symbols:
+                symbol_roots = self.lang_server.request_full_symbol_tree(within_relative_path=symbol["location"]["relativePath"], include_body=include_body)
+                for root in symbol_roots:
+                    symbols.extend(
+                        Symbol(root).find(name, include_kinds=include_kinds, exclude_kinds=exclude_kinds, substring_matching=substring_matching)
+                    )
 
         return symbols
 
