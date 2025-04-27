@@ -1,0 +1,10 @@
+{
+  "_description": "Used to download the runtime dependencies for running PHPActor.",
+  "runtimeDependencies": [
+    {
+      "id": "phpactor",
+      "description": "PHPActor - PHP Language Server and refactoring tool",
+      "command": "curl -Lo phpactor.phar https://github.com/phpactor/phpactor/releases/latest/download/phpactor.phar && mkdir -p bin && mv phpactor.phar bin/phpactor && chmod +x bin/phpactor"
+    }
+  ]
+}
