@@ -31,6 +31,8 @@ from serena import serena_root_path, serena_version
 from serena.llm.prompt_factory import PromptFactory
 from serena.symbol import SymbolLocation, SymbolManager
 from serena.text_utils import search_files
+from serena.tools.ripgrepy_search import RipGrepySearch
+from serena.util.class_decorators import singleton
 from serena.util.file_system import scan_directory
 from serena.util.inspection import iter_subclasses
 from serena.util.shell import execute_shell_command
@@ -1368,41 +1370,22 @@ class SearchForPatternTool(Tool):
             make a stricter query.
         :return: A JSON object mapping file paths to lists of matched consecutive lines (with context, if requested).
         """
-        if only_in_code_files:
-            matches = self.language_server.search_files_for_pattern(
-                pattern=pattern,
-                context_lines_before=context_lines_before,
-                context_lines_after=context_lines_after,
-                paths_include_glob=paths_include_glob,
-                paths_exclude_glob=paths_exclude_glob,
-            )
-        else:
-            # we walk through all files in the project starting from the root
-            files_to_search = []
-            ignore_spec = self.language_server.get_ignore_spec()
-            for root, dirs, files in os.walk(self.project_root):
-                # Don't go into directories that are ignored by modifying dirs inplace
-                # Explanation for the  + "/" part:
-                # pathspec can't handle the matching of directories if they don't end with a slash!
-                # see https://github.com/cpburnz/python-pathspec/issues/89
-                dirs[:] = [d for d in dirs if not ignore_spec.match_file(d + "/")]
-                for file in files:
-                    if not ignore_spec.match_file(os.path.join(root, file)):
-                        files_to_search.append(os.path.join(root, file))
-            # TODO (maybe): not super efficient to walk through the files again and filter if glob patterns are provided
-            #   but it probably never matters and this version required no further refactoring
-            matches = search_files(
-                files_to_search,
-                pattern,
-                paths_include_glob=paths_include_glob,
-                paths_exclude_glob=paths_exclude_glob,
-            )
-        # group matches by file
-        file_to_matches: dict[str, list[str]] = defaultdict(list)
-        for match in matches:
-            assert match.source_file_path is not None
-            file_to_matches[match.source_file_path].append(match.to_display_string())
-        result = json.dumps(file_to_matches)
+
+        # Create the search tool
+        search_tool = RipGrepySearch()
+
+        # Perform a search
+        rp_results = search_tool.search(
+            pattern=pattern,
+            path=self.project_root,
+            context_lines_before=context_lines_before,
+            context_lines_after=context_lines_after,
+            paths_include_glob=paths_include_glob,
+            paths_exclude_glob=paths_exclude_glob,
+            include_gitignore=True
+        )
+
+        result = json.dumps(rp_results)
         return self._limit_length(result, max_answer_chars)
 
 
