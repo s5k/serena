@@ -1349,7 +1349,7 @@ class SearchForPatternTool(Tool):
         context_lines_after: int = 0,
         paths_include_glob: str | None = None,
         paths_exclude_glob: str | None = None,
-        only_in_code_files: bool = True,
+        only_in_code_files: bool = False,
         max_answer_chars: int = _DEFAULT_MAX_ANSWER_LENGTH,
     ) -> str:
         """
@@ -1363,7 +1363,7 @@ class SearchForPatternTool(Tool):
         :param paths_include_glob: optional glob pattern specifying files to include in the search; if not provided, search globally.
         :param paths_exclude_glob: optional glob pattern specifying files to exclude from the search (takes precedence over paths_include_glob).
         :param only_in_code_files: whether to search only in code files or in the entire code base.
-            The explicitly ignored files (from serena config and gitignore) are never searched.
+            The explicitly ignored files (from serena config and gitignore, e.g: vendor or node_modules) are never searched.
         :param max_answer_chars: if the output is longer than this number of characters,
             no content will be returned. Don't adjust unless there is really no other way to get the content
             required for the task. Instead, if the output is too long, you should
@@ -1382,7 +1382,7 @@ class SearchForPatternTool(Tool):
             context_lines_after=context_lines_after,
             paths_include_glob=paths_include_glob,
             paths_exclude_glob=paths_exclude_glob,
-            include_gitignore=True
+            include_gitignore=only_in_code_files
         )
 
         result = json.dumps(rp_results)
