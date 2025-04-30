@@ -17,6 +17,7 @@ from enum import Enum
 from multilspy.multilspy_exceptions import MultilspyException
 from pathlib import PurePath, Path
 from multilspy.multilspy_logger import MultilspyLogger
+from multilspy.multilspy_types import UnifiedSymbolInformation
 
 
 class TextUtils:
@@ -90,7 +91,14 @@ class PathUtils:
         parsed = urlparse(uri)
         host = "{0}{0}{mnt}{0}".format(os.path.sep, mnt=parsed.netloc)
         return os.path.normpath(os.path.join(host, url2pathname(unquote(parsed.path))))
-    
+
+    @staticmethod
+    def path_to_uri(path: str) -> str:
+        """
+        Converts a file path to a file URI (file:///...).
+        """
+        return str(Path(path).absolute().as_uri())
+
     @staticmethod
     def is_glob_pattern(pattern: str) -> bool:
         """Check if a pattern contains glob-specific characters."""
@@ -315,3 +323,13 @@ class PlatformUtils:
             except (FileNotFoundError, subprocess.CalledProcessError):
                 raise MultilspyException("dotnet or mono not found on the system")
 
+
+class SymbolUtils:
+    @staticmethod
+    def symbol_tree_contains_name(roots: list[UnifiedSymbolInformation], name: str) -> bool:
+        for symbol in roots:
+            if symbol["name"] == name:
+                return True
+            if SymbolUtils.symbol_tree_contains_name(symbol["children"], name):
+                return True
+        return False

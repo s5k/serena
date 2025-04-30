@@ -14,7 +14,6 @@ import os
 import pathlib
 import pickle
 import re
-from site import abs_paths
 import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
@@ -26,12 +25,13 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union, 
 
 import pathspec
 
-from serena.text_utils import LineType, MatchedConsecutiveLines, TextLine, search_files, search_text
+from serena.text_utils import LineType, MatchedConsecutiveLines, TextLine, search_files
 from . import multilspy_types
 from .lsp_protocol_handler import lsp_types as LSPTypes
 from .lsp_protocol_handler.lsp_constants import LSPConstants
 from .lsp_protocol_handler.lsp_types import Diagnostic, SymbolKind
 from .lsp_protocol_handler.server import (
+    Error,
     LanguageServerHandler,
     ProcessLaunchInfo,
 )
@@ -642,6 +642,16 @@ class LanguageServer:
             
         return ret
 
+    # Some LS cause problems with this, so the call is isolated from the rest to allow overriding in subclasses
+    async def _send_references_request(self, relative_file_path: str, line: int, column: int):
+        return await self.server.send.references(
+            {
+                "textDocument": {"uri": PathUtils.path_to_uri(os.path.join(self.repository_root_path, relative_file_path))},
+                "position": {"line": line, "character": column},
+                "context": {"includeDeclaration": False},
+            }
+        )
+
     async def request_references(
         self, relative_file_path: str, line: int, column: int
     ) -> List[multilspy_types.Location]:
@@ -656,7 +666,7 @@ class LanguageServer:
 
         :return: A list of locations where the symbol is referenced (excluding ignored directories)
         """
-
+        
         if not self.server_started:
             self.logger.log(
                 "request_references called before Language Server started",
@@ -665,16 +675,18 @@ class LanguageServer:
             raise MultilspyException("Language Server not started")
 
         with self.open_file(relative_file_path):
-            # sending request to the language server and waiting for response
-            response = await self.server.send.references(
-                {
-                    "context": {"includeDeclaration": False},
-                    "textDocument": {
-                        "uri": pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()
-                    },
-                    "position": {"line": line, "character": column},
-                }
-            )
+            try:
+                response = await self._send_references_request(relative_file_path, line=line, column=column)
+            except Exception as e:
+                # Catch LSP internal error (-32603) and raise a more informative exception
+                if isinstance(e, Error) and getattr(e, 'code', None) == -32603:
+                    raise RuntimeError(
+                        f"LSP internal error (-32603) when requesting references for {relative_file_path}:{line}:{column}. "
+                        "This often occurs when requesting references for a symbol not referenced in the expected way. "
+                    ) from e
+                raise
+        if response is None:
+            return []
 
         ret: List[multilspy_types.Location] = []
         # Handle case where response is None
@@ -685,7 +697,7 @@ class LanguageServer:
         assert isinstance(response, list), f"Unexpected response from Language Server: {response}"
         
         for item in response:
-            assert isinstance(item, dict)
+            assert isinstance(item, dict), f"Unexpected response from Language Server (expected dict, got {type(item)}): {item}"
             assert LSPConstants.URI in item
             assert LSPConstants.RANGE in item
 
@@ -1863,10 +1875,20 @@ class SyncLanguageServer:
 
         :return List[multilspy_types.Location]: A list of locations where the symbol is referenced
         """
-        result = asyncio.run_coroutine_threadsafe(
-            self.language_server.request_references(file_path, line, column), self.loop
-        ).result(timeout=self.timeout)
+        try:
+            result = asyncio.run_coroutine_threadsafe(
+                self.language_server.request_references(file_path, line, column), self.loop
+            ).result(timeout=self.timeout)
+        except Exception as e:
+            from multilspy.lsp_protocol_handler.server import Error
+            if isinstance(e, Error) and getattr(e, 'code', None) == -32603:
+                raise RuntimeError(
+                    f"LSP internal error (-32603) when requesting references for {file_path}:{line}:{column}. "
+                    "This often occurs when requesting references for a symbol not referenced in the expected way. "
+                ) from e
+            raise
         return result
+
 
     def request_references_with_content(
         self, relative_file_path: str, line: int, column: int, context_lines_before: int = 0, context_lines_after: int = 0
