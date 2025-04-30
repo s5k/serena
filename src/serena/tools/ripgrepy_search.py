@@ -1,13 +1,15 @@
-from typing import Dict, List, Optional, Union
-import json
+import logging
+from typing import Dict, List, Optional
 import os
 from pydantic import BaseModel, Field
-from ripgrepy import RipGrepOut 
+
+from serena.overrides.enhanced_ripgrepy import EnhancedRipgrepy
+
+log = logging.getLogger(__name__)
 
 class RipGrepySearchResult(BaseModel):
     """Model representing the result of a RipGrepy search, with file paths as keys and formatted matches as values."""
     results: Dict[str, List[str]] = Field(default_factory=dict, description="Dictionary with file paths as keys and formatted matches as values")
-
 
 class RipGrepySearch:
     """
@@ -42,11 +44,8 @@ class RipGrepySearch:
             A formatted dictionary with file paths as keys and match content as values
         """
         try:
-            # Import here to avoid dependency issues if ripgrepy is not installed
-            from ripgrepy import Ripgrepy
-            
             # Initialize Ripgrepy with the pattern and path
-            rg = Ripgrepy(pattern, path)
+            rg = EnhancedRipgrepy(pattern, path)
             
             # Set context lines before and after matches
             if context_lines_before > 0:
@@ -56,15 +55,14 @@ class RipGrepySearch:
                 rg.after_context(context_lines_after)
             
             # Include or exclude specific files/directories using glob patterns
-            if paths_include_glob:
-                rg.glob(paths_include_glob)
-            
             if paths_exclude_glob:
                 # The ! prefix in glob patterns indicates exclusion
                 rg.glob(f"!{paths_exclude_glob}")
-            
+            elif paths_include_glob:
+                rg.glob(paths_include_glob)
+
             # Include files/directories normally ignored by .gitignore if requested
-            if include_gitignore:
+            if not include_gitignore:
                 rg.no_ignore()
             
             # Include line numbers in the output
@@ -76,8 +74,8 @@ class RipGrepySearch:
             # Get results
             result = rg.run()
 
-            # Execute the search
-            matches = self.as_dict(result)
+            # Get matches
+            matches = result.as_dict
 
             # Format the results into the requested structure
             return self._format_matches(matches)
@@ -138,31 +136,3 @@ class RipGrepySearch:
                     formatted_results[file_path] = [f"{content}\n{formatted_line.rstrip()}"]
         
         return formatted_results
-
-    def as_dict(self, output: RipGrepOut) -> list:
-        """
-        Returns an array of objects with the match. The objects include
-        file path, line number and matched value. This is in addition to the
-        --json that can be passed to ripgrep and is designed for simple ripgrep use
-
-        :return: Array of matched objects
-        :rtype: list
-
-        The following is an example of the dict output.
-
-        >>> [{'data': {'absolute_offset': 12,
-        >>>   'line_number': 3,
-        >>>   'lines': {'text': 'teststring\\n'},
-        >>>   'path': {'text': '/tmp/test/test.lol'},
-        >>>   'submatches': [{'end': 4, 'match': {'text': 'test'}, 'start': 0}]},
-        >>> 'type': 'match' | 'context'}]
-        """
-        if "--json" not in output.command:
-            raise TypeError("To use as_dict, use the json() method")
-        out = output._output.splitlines()
-        holder = []
-        for line in out:
-            data = json.loads(line)
-            if data["type"] in ("match", "context"):
-                holder.append(data)
-        return holder
