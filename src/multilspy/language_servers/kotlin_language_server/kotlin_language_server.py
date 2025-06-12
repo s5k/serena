@@ -67,7 +67,7 @@ class KotlinLanguageServer(LanguageServer):
         assert platform_id.value.startswith("win-") or platform_id.value.startswith("linux-") or platform_id.value.startswith("osx-"), "Only Windows, Linux and macOS platforms are supported for Kotlin in multilspy at the moment"
 
         # Load dependency information
-        with open(os.path.join(os.path.dirname(__file__), "runtime_dependencies.json"), "r") as f:
+        with open(os.path.join(os.path.dirname(__file__), "runtime_dependencies.json"), "r", encoding="utf-8") as f:
             d = json.load(f)
             del d["_description"]
         
@@ -134,7 +134,7 @@ class KotlinLanguageServer(LanguageServer):
         """
         Returns the initialize params for the Kotlin Language Server.
         """
-        with open(str(pathlib.PurePath(os.path.dirname(__file__), "initialize_params.json")), "r") as f:
+        with open(str(pathlib.PurePath(os.path.dirname(__file__), "initialize_params.json")), "r", encoding="utf-8") as f:
             d: InitializeParams = json.load(f)
 
         del d["_description"]
@@ -225,10 +225,3 @@ class KotlinLanguageServer(LanguageServer):
             self.completions_available.set()
 
             yield self
-
-            try:
-                await self.server.shutdown()
-            except Exception as e:
-                self.logger.log(f"Error during Kotlin server shutdown: {str(e)}", logging.WARNING)
-            finally:
-                await self.server.stop()

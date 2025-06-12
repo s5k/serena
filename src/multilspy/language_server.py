@@ -21,19 +21,20 @@ from copy import copy
 from typing import Any, Dict, List, Optional, Tuple, Union
 from fnmatch import fnmatch
 from pathlib import Path, PurePath
+import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import pathspec
 
-from serena.text_utils import LineType, MatchedConsecutiveLines, TextLine, search_files
 from . import multilspy_types
 from .lsp_protocol_handler import lsp_types as LSPTypes
 from .lsp_protocol_handler.lsp_constants import LSPConstants
-from .lsp_protocol_handler.lsp_types import Diagnostic, SymbolKind
+from .lsp_protocol_handler.lsp_types import Definition, DefinitionParams, LocationLink, Diagnostic, SymbolKind
 from .lsp_protocol_handler.server import (
     Error,
     LanguageServerHandler,
     ProcessLaunchInfo,
+    StringDict,
 )
 from .multilspy_config import Language, MultilspyConfig
 from .multilspy_exceptions import MultilspyException
@@ -44,7 +45,7 @@ from typing import AsyncIterator, Iterator, List, Dict, Optional, Union, Tuple
 from .multilspy_logger import MultilspyLogger
 from .multilspy_utils import FileUtils, PathUtils, TextUtils
 from .type_helpers import ensure_all_methods_implemented
-from multilspy.lsp_protocol_handler import lsp_types
+from .lsp_protocol_handler import lsp_types
 
 # Serena dependencies
 # We will need to watch out for circular imports, but it's probably better to not
@@ -53,10 +54,19 @@ from multilspy.lsp_protocol_handler import lsp_types
 # since it caches (in-memory) file contents, so we can avoid reading from disk.
 # Moreover, the way we want to use the language server (for retrieving actual content),
 # it makes sense to have more content-related utils directly in it.
+from serena.text_utils import LineType, MatchedConsecutiveLines, TextLine, search_files
+
 
 
 GenericDocumentSymbol = Union[LSPTypes.DocumentSymbol, LSPTypes.SymbolInformation, multilspy_types.UnifiedSymbolInformation]
 
+@dataclasses.dataclass(kw_only=True)
+class ReferenceInSymbol:
+    """A symbol retrieved when requesting reference to a symbol, together with the location of the reference"""
+    symbol: multilspy_types.UnifiedSymbolInformation
+    line: int
+    character: int
+    
 @dataclasses.dataclass
 class LSPFileBuffer:
     """
@@ -101,7 +111,7 @@ class LanguageServer:
         return dirname.startswith('.')
 
     @classmethod
-    def create(cls, config: MultilspyConfig, logger: MultilspyLogger, repository_root_path: str, add_gitignore_content_to_config: bool = True) -> "LanguageServer":
+    def create(cls, config: MultilspyConfig, logger: MultilspyLogger, repository_root_path: str) -> "LanguageServer":
         """
         Creates a language specific LanguageServer instance based on the given configuration, and appropriate settings for the programming language.
 
@@ -111,29 +121,8 @@ class LanguageServer:
         :param repository_root_path: The root path of the repository.
         :param config: The Multilspy configuration.
         :param logger: The logger to use.
-        :param add_gitignore_content_to_config: whether to add the content of the .gitignore file (if any found) to the config, so that
-            the paths ignored there are also ignored by the language server
-
         :return LanguageServer: A language specific LanguageServer instance.
         """
-        config = copy(config)  # prevent mutation
-        if add_gitignore_content_to_config:
-            gitignore_path = os.path.join(repository_root_path, ".gitignore")
-            if not os.path.exists(gitignore_path):
-                logger.log(
-                    f"Should ignore all files in gitignore not not .gitignore found at {gitignore_path}. Skipping.",
-                    logging.WARNING
-                )
-                gitignore_file_content = None
-            else:
-                if config.gitignore_file_content is not None:
-                    raise ValueError(
-                        f"Asked to add gitignore content to the config for {repository_root_path=} but there already is a non-empty entry"
-                    )
-                with open(gitignore_path) as f:
-                    gitignore_file_content = f.read()
-            config.gitignore_file_content = gitignore_file_content
-
         if config.code_language == Language.PYTHON:
             from multilspy.language_servers.pyright_language_server.pyright_server import (
                 PyrightServer,
@@ -142,11 +131,11 @@ class LanguageServer:
             return PyrightServer(config, logger, repository_root_path)
             # It used to be jedi, but pyright is a bit faster, and also more actively maintained
             # Keeping the previous code for reference
-            from multilspy.language_servers.jedi_language_server.jedi_server import (
-                JediServer,
-            )
+            # from multilspy.language_servers.jedi_language_server.jedi_server import (
+            #     JediServer,
+            # )
 
-            return JediServer(config, logger, repository_root_path)
+            # return JediServer(config, logger, repository_root_path)
         elif config.code_language == Language.JAVA:
             from multilspy.language_servers.eclipse_jdtls.eclipse_jdtls import (
                 EclipseJDTLS,
@@ -225,24 +214,30 @@ class LanguageServer:
             )
 
         self.logger = logger
-        self.server_started = False
         self.repository_root_path: str = repository_root_path
+        self.logger.log(f"Creating language server instance for {repository_root_path=} with {language_id=} and process launch info: {process_launch_info}", logging.DEBUG)
+        
+        # load cache first to prevent any racing conditions due to asyncio stuff
+        self._document_symbols_cache:  dict[str, Tuple[str, Tuple[List[multilspy_types.UnifiedSymbolInformation], List[multilspy_types.UnifiedSymbolInformation]]]] = {}
+        """Maps file paths to a tuple of (file_content_hash, result_of_request_document_symbols)"""
+        self._cache_lock = threading.Lock()
+        self._cache_has_changed: bool = False
+        self.load_cache()
+
+        self.server_started = False
         self.completions_available = asyncio.Event()
         self._diagnostics_store: Dict[str, List[Diagnostic]] = {}
-
         if config.trace_lsp_communication:
-
-            def logging_fn(source, target, msg):
+            def logging_fn(source: str, target: str, msg: StringDict | str):
                 self.logger.log(f"LSP: {source} -> {target}: {str(msg)}", logging.DEBUG)
-
         else:
-
-            def logging_fn(source, target, msg):
-                pass
+            logging_fn = None
+            
 
         # cmd is obtained from the child classes, which provide the language specific command to start the language server
         # LanguageServerHandler provides the functionality to start the language server and communicate with it
-        self.server: LanguageServerHandler = LanguageServerHandler(
+        self.logger.log(f"Creating language server instance with {language_id=} and process launch info: {process_launch_info}", logging.DEBUG)
+        self.server = LanguageServerHandler(
             process_launch_info,
             logger=logging_fn,
             start_independent_lsp_process=config.start_independent_lsp_process,
@@ -251,11 +246,6 @@ class LanguageServer:
         self.language_id = language_id
         self.open_file_buffers: Dict[str, LSPFileBuffer] = {}
 
-        # --------------------------------- MODIFICATIONS BY ORAIOS ---------------------------------
-        self._document_symbols_cache:  dict[str, Tuple[str, Tuple[List[multilspy_types.UnifiedSymbolInformation], List[multilspy_types.UnifiedSymbolInformation]]]] = {}
-        """Maps file paths to a tuple of (file_content_hash, result_of_request_document_symbols)"""
-        self.load_cache()
-        self._cache_has_changed = bool
         self.language = Language(language_id)
         
         # Create the URI-to-Path mapper with caching
@@ -268,11 +258,7 @@ class LanguageServer:
             # Normalize separators (pathspec expects forward slashes)
             pattern = pattern.replace(os.path.sep, '/')
             processed_patterns.append(pattern)
-        # Combine explicitly passed patterns with the content of the .gitignore file
-        if config.gitignore_file_content is not None:
-            for line in config.gitignore_file_content.splitlines():
-                if not line.startswith('#') and line.strip() != '':
-                    processed_patterns.append(line.strip())
+        self.logger.log(f"Processing {len(processed_patterns)} ignored paths from the config", logging.DEBUG)
 
         # Create a pathspec matcher from the processed patterns
         self._ignore_spec = pathspec.PathSpec.from_lines(
@@ -333,7 +319,7 @@ class LanguageServer:
 
     def get_ignore_spec(self) -> pathspec.PathSpec:
         """Returns the pathspec matcher for the paths that were configured to be ignored through
-        the multilspy config file and the .gitignore file.
+        the multilspy config.
 
         This is is a subset of the full language-specific ignore spec that determines
         which files are relevant for the language server.
@@ -387,33 +373,96 @@ class LanguageServer:
             normalized_path = normalized_path + '/'
 
         # Use the pathspec matcher to check if the path matches any ignore pattern
-        if self._ignore_spec.match_file(normalized_path):
+        if self.get_ignore_spec().match_file(normalized_path):
             return True
 
         return False
+    
+    async def _shutdown(self, timeout: float = 10.0):
+        """
+        A robust shutdown process designed to terminate cleanly on all platforms, including Windows,
+        by explicitly closing all I/O pipes.
+        """
+        if not self.server.is_running():
+            self.logger.log("Server process not running, skipping shutdown.", logging.DEBUG)
+            return
 
+        self.logger.log(f"Initiating final robust shutdown with a {timeout}s timeout...", logging.INFO)
+        process = self.server.process
+        reader_tasks = list(self.server.tasks.values())
+
+        # --- Main Shutdown Logic ---
+        try:
+            # Stage 1: Graceful Termination Request
+            # Send LSP shutdown and close stdin to signal no more input.
+            try:
+                await asyncio.wait_for(self.server.shutdown(), timeout=2.0)
+                if process.stdin and not process.stdin.is_closing():
+                    process.stdin.close()
+            except Exception:
+                pass # Ignore errors here, we are proceeding to terminate anyway.
+
+            # Stage 2: Terminate and Concurrently Drain stdout/stderr
+            process.terminate()
+            
+            # Wait for the process to exit AND for the output pipes to be drained.
+            # The reader tasks will exit when they hit EOF.
+            await asyncio.wait_for(
+                asyncio.gather(process.wait(), *reader_tasks),
+                timeout=timeout - 2.0
+            )
+            self.logger.log("Process terminated and output pipes drained.", logging.INFO)
+
+        except asyncio.TimeoutError:
+            # Stage 3: Forceful Kill
+            self.logger.log("Graceful termination failed. Forcefully killing process...", logging.WARNING)
+            if self.server.is_running():
+                try:
+                    process.kill()
+                    # Wait for the killed process to be reaped by the OS.
+                    await process.wait()
+                except Exception as e:
+                    self.logger.log(f"Error during forceful kill: {e}", logging.ERROR)
+        
+        except Exception as e:
+            self.logger.log(f"An unexpected error occurred during shutdown logic: {e}", logging.ERROR)
+
+        finally:
+            # === STAGE 4: EXPLICIT TASK & PIPE CLEANUP ===
+            self.logger.log("Performing final task cancellation and pipe handle cleanup...", logging.DEBUG)
+            
+            # 1. Cancel any lingering reader tasks.
+            for task in reader_tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait for cancellations to complete.
+            await asyncio.gather(*reader_tasks, return_exceptions=True)
+            self.server.tasks = {}
+
+            # 2. Explicitly close each pipe to release OS handles.
+            for pipe in [process.stdin, process.stdout, process.stderr]:
+                if pipe and hasattr(pipe, 'is_closing') and not pipe.is_closing():
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+            
+            # 3. Null out the process object in the handler.
+            self.server.process = None
+            self.logger.log("Shutdown sequence fully finished.", logging.DEBUG)
 
     @asynccontextmanager
     async def start_server(self) -> AsyncIterator["LanguageServer"]:
         """
         Starts the Language Server and yields the LanguageServer instance.
-
-        Usage:
-        ```
-        async with lsp.start_server():
-            # LanguageServer has been initialized and ready to serve requests
-            await lsp.request_definition(...)
-            await lsp.request_references(...)
-            # Shutdown the LanguageServer on exit from scope
-        # LanguageServer has been shutdown
-        ```
         """
         self.server_started = True
-        yield self
-        self.server_started = False
-
-    # TODO: Add support for more LSP features
-
+        try:
+            yield self
+        finally:
+            self.server_started = False
+            await self._shutdown()
+    
     @contextmanager
     def open_file(self, relative_file_path: str) -> Iterator[LSPFileBuffer]:
         """
@@ -494,10 +543,9 @@ class LanguageServer:
 
         file_buffer = self.open_file_buffers[uri]
         file_buffer.version += 1
-        change_index = TextUtils.get_index_from_line_col(file_buffer.contents, line, column)
-        file_buffer.contents = (
-            file_buffer.contents[:change_index] + text_to_be_inserted + file_buffer.contents[change_index:]
-        )
+
+        new_contents, new_l, new_c = TextUtils.insert_text_at_position(file_buffer.contents, line, column, text_to_be_inserted)
+        file_buffer.contents = new_contents
         self.server.notify.did_change_text_document(
             {
                 LSPConstants.TEXT_DOCUMENT: {
@@ -515,7 +563,6 @@ class LanguageServer:
                 ],
             }
         )
-        new_l, new_c = TextUtils.get_updated_position_from_line_and_column_and_edit(line, column, text_to_be_inserted)
         return multilspy_types.Position(line=new_l, character=new_c)
 
     def delete_text_between_positions(
@@ -542,10 +589,8 @@ class LanguageServer:
 
         file_buffer = self.open_file_buffers[uri]
         file_buffer.version += 1
-        del_start_idx = TextUtils.get_index_from_line_col(file_buffer.contents, start["line"], start["character"])
-        del_end_idx = TextUtils.get_index_from_line_col(file_buffer.contents, end["line"], end["character"])
-        deleted_text = file_buffer.contents[del_start_idx:del_end_idx]
-        file_buffer.contents = file_buffer.contents[:del_start_idx] + file_buffer.contents[del_end_idx:]
+        new_contents, deleted_text = TextUtils.delete_text_between_positions(file_buffer.contents, start_line=start["line"], start_col=start["character"], end_line=end["line"], end_col=end["character"])
+        file_buffer.contents = new_contents
         self.server.notify.did_change_text_document(
             {
                 LSPConstants.TEXT_DOCUMENT: {
@@ -557,6 +602,9 @@ class LanguageServer:
         )
         return deleted_text
 
+    async def _send_definition_request(self, definition_params: DefinitionParams) -> Union[Definition, List[LocationLink], None]:
+        return await self.server.send.definition(definition_params)
+    
     async def request_definition(
         self, relative_file_path: str, line: int, column: int
     ) -> List[multilspy_types.Location]:
@@ -580,19 +628,18 @@ class LanguageServer:
 
         with self.open_file(relative_file_path):
             # sending request to the language server and waiting for response
-            response = await self.server.send.definition(
-                {
-                    LSPConstants.TEXT_DOCUMENT: {
-                        LSPConstants.URI: pathlib.Path(
-                            str(PurePath(self.repository_root_path, relative_file_path))
-                        ).as_uri()
-                    },
-                    LSPConstants.POSITION: {
-                        LSPConstants.LINE: line,
-                        LSPConstants.CHARACTER: column,
-                    },
-                }
-            )
+            definition_params = cast(DefinitionParams, {
+                LSPConstants.TEXT_DOCUMENT: {
+                    LSPConstants.URI: pathlib.Path(
+                        str(PurePath(self.repository_root_path, relative_file_path))
+                    ).as_uri()
+                },
+                LSPConstants.POSITION: {
+                    LSPConstants.LINE: line,
+                    LSPConstants.CHARACTER: column,
+                },
+            })
+            response = await self._send_definition_request(definition_params)
 
         ret: List[multilspy_types.Location] = []
         
@@ -643,7 +690,7 @@ class LanguageServer:
         return ret
 
     # Some LS cause problems with this, so the call is isolated from the rest to allow overriding in subclasses
-    async def _send_references_request(self, relative_file_path: str, line: int, column: int):
+    async def _send_references_request(self, relative_file_path: str, line: int, column: int) -> List[lsp_types.Location] | None:
         return await self.server.send.references(
             {
                 "textDocument": {"uri": PathUtils.path_to_uri(os.path.join(self.repository_root_path, relative_file_path))},
@@ -750,22 +797,7 @@ class LanguageServer:
         """
         with self.open_file(relative_file_path) as file_data:
             file_contents = file_data.contents
-
-        line_contents = file_contents.split("\n")
-        start_lineno = max(0, line - context_lines_before)
-        end_lineno = min(len(line_contents) - 1, line + context_lines_after)
-        # instantiate TextLines with the write LineType
-        text_lines: list[TextLine] = []
-        # before the line
-        for lineno in range(start_lineno, line):
-            text_lines.append(TextLine(line_number=lineno, line_content=line_contents[lineno], match_type=LineType.BEFORE_MATCH))
-        # the line
-        text_lines.append(TextLine(line_number=line, line_content=line_contents[line], match_type=LineType.MATCH))
-        # after the line
-        for lineno in range(line + 1, end_lineno + 1):
-            text_lines.append(TextLine(line_number=lineno, line_content=line_contents[lineno], match_type=LineType.AFTER_MATCH))
-
-        return MatchedConsecutiveLines(lines=text_lines, source_file_path=relative_file_path)
+        return MatchedConsecutiveLines.from_file_contents(file_contents, line=line, context_lines_before=context_lines_before, context_lines_after=context_lines_after, source_file_path=relative_file_path)
 
 
     async def request_completions(
@@ -870,24 +902,29 @@ class LanguageServer:
         :param relative_file_path: The relative path of the file that has the symbols
         :param include_body: whether to include the body of the symbols in the result.
         :return: A list of symbols in the file, and a list of root symbols that represent the tree structure of the symbols.
-            Each symbol in hierarchy starting from the roots has a children attribute.
-            All symbols will have a location and a children attribute.
+            All symbols will have a location, a children, and a parent attribute,
+            where the parent attribute is None for root symbols.
+            Note that this is slightly different from the call to request_full_symbol_tree,
+            where the parent attribute will be the file symbol which in turn may have a package symbol as parent.
+            If you need a symbol tree that contains file symbols as well, you should use `request_full_symbol_tree` instead.
         """
-        self.logger.log(f"Requesting document symbols for {relative_file_path} for the first time", logging.DEBUG)
         # TODO: it's kinda dumb to not use the cache if include_body is False after include_body was True once
         #   Should be fixed in the future, it's a small performance optimization
         cache_key = f"{relative_file_path}-{include_body}"
         with self.open_file(relative_file_path) as file_data:
-            file_hash_and_result = self._document_symbols_cache.get(cache_key)
-            if file_hash_and_result is not None:
-                file_hash, result = file_hash_and_result
-                if file_hash == file_data.content_hash:
-                    self.logger.log(f"Returning cached document symbols for {relative_file_path}", logging.DEBUG)
-                    return result
+            with self._cache_lock:
+                file_hash_and_result = self._document_symbols_cache.get(cache_key)
+                if file_hash_and_result is not None:
+                    file_hash, result = file_hash_and_result
+                    if file_hash == file_data.content_hash:
+                        self.logger.log(f"Returning cached document symbols for {relative_file_path}", logging.DEBUG)
+                        return result
+                    else:
+                        self.logger.log(f"Content for {relative_file_path} has changed. Will overwrite in-memory cache", logging.DEBUG)
                 else:
-                    self.logger.log(f"Content for {relative_file_path} has changed. Overwriting cache", logging.INFO)
+                    self.logger.log(f"No cache hit for symbols with {include_body=} in {relative_file_path}", logging.DEBUG)
 
-
+            self.logger.log(f"Requesting document symbols for {relative_file_path} from the Language Server", logging.DEBUG)
             response = await self.server.send.document_symbol(
                 {
                     "textDocument": {
@@ -895,6 +932,7 @@ class LanguageServer:
                     }
                 }
             )
+            self.logger.log(f"Received {len(response) if response is not None else None} document symbols for {relative_file_path} from the Language Server", logging.DEBUG)
 
         # Handle case where response is None
         if response is None:
@@ -952,23 +990,26 @@ class LanguageServer:
 
         result = flat_all_symbol_list, root_nodes
         self.logger.log(f"Caching document symbols for {relative_file_path}", logging.DEBUG)
-        self._document_symbols_cache[cache_key] = (file_data.content_hash, result)
-        self._cache_has_changed = True
+        with self._cache_lock:
+            self._document_symbols_cache[cache_key] = (file_data.content_hash, result)
+            self._cache_has_changed = True
         return result
     
     async def request_full_symbol_tree(self, within_relative_path: str | None = None, include_body: bool = False) -> List[multilspy_types.UnifiedSymbolInformation]:
         """
-        Will go through all files in the project and build a tree of symbols. Note: this may be slow the first time it is called.
+        Will go through all files in the project or within a relative path and build a tree of symbols. 
+        Note: this may be slow the first time it is called, especially if `within_relative_path` is not used to restrict the search.
 
-        For each file, a symbol of kind Module (3) will be created. For directories, a symbol of kind Package (4) will be created.
+        For each file, a symbol of kind File (2) will be created. For directories, a symbol of kind Package (4) will be created.
         All symbols will have a children attribute, thereby representing the tree structure of all symbols in the project
         that are within the repository.
+        All symbols except the root packages will have a parent attribute.
         Will ignore directories starting with '.', language-specific defaults
         and user-configured directories (e.g. from .gitignore).
 
         :param within_relative_path: pass a relative path to only consider symbols within this path.
-                If a file is passed, only the symbols within this file will be considered.
-                If a directory is passed, all files within this directory will be considered.
+            If a file is passed, only the symbols within this file will be considered.
+            If a directory is passed, all files within this directory will be considered.
         :param include_body: whether to include the body of the symbols in the result.
 
         :return: A list of root symbols representing the top-level packages/modules in the project.
@@ -987,17 +1028,17 @@ class LanguageServer:
                     return root_nodes
 
         # Helper function to recursively process directories
-        async def process_directory(dir_path: str) -> List[multilspy_types.UnifiedSymbolInformation]:
-            abs_dir_path = self.repository_root_path if dir_path == "." else os.path.join(self.repository_root_path, dir_path)
+        async def process_directory(rel_dir_path: str) -> List[multilspy_types.UnifiedSymbolInformation]:
+            abs_dir_path = self.repository_root_path if rel_dir_path == "." else os.path.join(self.repository_root_path, rel_dir_path)
             abs_dir_path = os.path.realpath(abs_dir_path)
 
             if self.is_ignored_path(str(Path(abs_dir_path).relative_to(self.repository_root_path))):
-                self.logger.log(f"Skipping directory: {dir_path}\n(because it should be ignored)", logging.DEBUG)
+                self.logger.log(f"Skipping directory: {rel_dir_path}\n(because it should be ignored)", logging.DEBUG)
                 return []
 
             result = []
             try:
-                items = os.listdir(abs_dir_path)
+                contained_dir_or_file_names = os.listdir(abs_dir_path)
             except OSError:
                 return []
 
@@ -1015,20 +1056,45 @@ class LanguageServer:
             )
             result.append(package_symbol)
 
-            for item in items:
-                item_path = os.path.join(abs_dir_path, item)
-                abs_item_path = os.path.join(self.repository_root_path, item_path)
-                rel_item_path = str(Path(abs_item_path).resolve().relative_to(self.repository_root_path))
-                if self.is_ignored_path(rel_item_path):
-                    self.logger.log(f"Skipping item: {rel_item_path}\n(because it should be ignored)", logging.DEBUG)
+            for contained_dir_or_file_name in contained_dir_or_file_names:
+                contained_dir_or_file_abs_path = os.path.join(abs_dir_path, contained_dir_or_file_name)
+                contained_dir_or_file_rel_path = str(Path(contained_dir_or_file_abs_path).resolve().relative_to(self.repository_root_path))
+                if self.is_ignored_path(contained_dir_or_file_rel_path):
+                    self.logger.log(f"Skipping item: {contained_dir_or_file_rel_path}\n(because it should be ignored)", logging.DEBUG)
                     continue
 
-                if os.path.isdir(abs_item_path):
-                    child_symbols = await process_directory(item_path)
+                if os.path.isdir(contained_dir_or_file_abs_path):
+                    child_symbols = await process_directory(contained_dir_or_file_rel_path)
                     package_symbol["children"].extend(child_symbols)
+                    for child in child_symbols:
+                        child["parent"] = package_symbol
+                        
+                elif os.path.isfile(contained_dir_or_file_abs_path):
+                    _, file_root_nodes = await self.request_document_symbols(contained_dir_or_file_rel_path, include_body=include_body)
+                    
+                    # Create file symbol, link with children
+                    file_rel_path = str(Path(contained_dir_or_file_abs_path).resolve().relative_to(self.repository_root_path))
+                    with self.open_file(file_rel_path) as file_data:
+                        fileRange = self._get_range_from_file_content(file_data.contents)
+                    file_symbol = multilspy_types.UnifiedSymbolInformation( # type: ignore
+                        name=os.path.splitext(contained_dir_or_file_name)[0],
+                        kind=multilspy_types.SymbolKind.File,
+                        range=fileRange,
+                        selectionRange=fileRange,
+                        location=multilspy_types.Location(
+                            uri=str(pathlib.Path(contained_dir_or_file_abs_path).as_uri()),
+                            range=fileRange,
+                            absolutePath=str(contained_dir_or_file_abs_path),
+                            relativePath=str(Path(contained_dir_or_file_abs_path).resolve().relative_to(self.repository_root_path)),
+                        ),
+                        children=file_root_nodes,
+                        parent=package_symbol,
+                    )
+                    for child in file_root_nodes:
+                        child["parent"] = file_symbol
 
-                elif os.path.isfile(abs_item_path):
-                    _, root_nodes = await self.request_document_symbols(item_path, include_body=include_body)
+                    # Link file symbol with package
+                    package_symbol["children"].append(file_symbol)
 
                     # TODO: Not sure if this is actually still needed given recent changes to relative path handling
                     def fix_relative_path(nodes: List[multilspy_types.UnifiedSymbolInformation]):
@@ -1045,33 +1111,13 @@ class LanguageServer:
                             if "children" in node:
                                 fix_relative_path(node["children"])
 
-                    fix_relative_path(root_nodes)
-
-                    # Create file symbol
-                    file_rel_path = str(Path(abs_item_path).resolve().relative_to(self.repository_root_path))
-                    with self.open_file(file_rel_path) as file_data:
-                        fileRange = self._get_range_from_file_content(file_data.contents)
-                    file_symbol = multilspy_types.UnifiedSymbolInformation( # type: ignore
-                        name=os.path.splitext(item)[0],
-                        kind=multilspy_types.SymbolKind.File,
-                        range=fileRange,
-                        selectionRange=fileRange,
-                        location=multilspy_types.Location(
-                            uri=str(pathlib.Path(abs_item_path).as_uri()),
-                            range=fileRange,
-                            absolutePath=str(abs_item_path),
-                            relativePath=str(Path(abs_item_path).resolve().relative_to(self.repository_root_path)),
-                        ),
-                        children=root_nodes
-                    )
-
-                    package_symbol["children"].append(file_symbol)
+                    fix_relative_path(file_root_nodes)
 
             return result
 
         # Start from the root or the specified directory
-        start_path = within_relative_path or "."
-        return await process_directory(start_path)
+        start_rel_path = within_relative_path or "."
+        return await process_directory(start_rel_path)
 
     @staticmethod
     def _get_range_from_file_content(file_content: str) -> multilspy_types.Range:
@@ -1214,42 +1260,25 @@ class LanguageServer:
 
 
     async def request_parsed_files(self) -> list[str]:
-        """
-        Retrieves relative paths of all files analyzed by the Language Server.
-
-        This is slow, as it finds all files by finding all symbols.
-
-        This seems to be the only way, the LSP does not provide any endpoints for listing project files."""
+        """Retrieves relative paths of all files analyzed by the Language Server."""
         if not self.server_started:
             self.logger.log(
                 "request_parsed_files called before Language Server started",
                 logging.ERROR,
             )
             raise MultilspyException("Language Server not started")
-        # TODO: this worked in jedi, but pyright and basedpyright return nothing...
-        # I don't know why
-        # params = LSPTypes.WorkspaceSymbolParams(query="")  # Empty query returns all symbols
-        # symbols = await self.server.send.workspace_symbol(params) or []
-
-        # Thus, instead of calling all symbols, we hack this and use the symbol tree instead, which
-        # seems to work in all these language servers
-        # walk through all children recursively, find all symbols of type Module and collect their relative paths
-        roots = await self.request_full_symbol_tree()
-        paths = []
-        def collect_module_files(symbol):
-            if symbol["kind"] == multilspy_types.SymbolKind.File:
-                assert "location" in symbol
-                paths.append(symbol["location"]["relativePath"])
-
-            elif symbol["kind"] == multilspy_types.SymbolKind.Package:
-                for child in symbol["children"]:
-                    collect_module_files(child)
-
-        for root in roots:
-            collect_module_files(root)
-
-        return paths
-
+        rel_file_paths = []
+        for root, dirs, files in os.walk(self.repository_root_path):
+            # Don't go into directories that are ignored by modifying dirs inplace
+            # Explanation for the  + "/" part:
+            # pathspec can't handle the matching of directories if they don't end with a slash!
+            # see https://github.com/cpburnz/python-pathspec/issues/89
+            dirs[:] = [d for d in dirs if not self.is_ignored_path(os.path.join(root, d) + "/")]
+            for file in files:
+                rel_file_path = os.path.join(root, file)
+                if not self.is_ignored_path(rel_file_path):
+                    rel_file_paths.append(rel_file_path)
+        return rel_file_paths
 
     async def search_files_for_pattern(
         self,
@@ -1292,7 +1321,7 @@ class LanguageServer:
         include_self: bool = False,
         include_body: bool = False,
         include_file_symbols: bool = False,
-    ) -> List[multilspy_types.UnifiedSymbolInformation]:
+    ) -> List[ReferenceInSymbol]:
         """
         Finds all symbols that reference the symbol at the given location.
         This is similar to request_references but filters to only include symbols
@@ -1309,7 +1338,7 @@ class LanguageServer:
         :param include_body: whether to include the body of the symbols in the result.
         :param include_file_symbols: whether to include references that are file symbols. This
             is often a fallback mechanism for when the reference cannot be resolved to a symbol.
-        :return: List of symbols that reference the target symbol.
+        :return: List of objects containing the symbol and the location of the reference.
         """
         if not self.server_started:
             self.logger.log(
@@ -1404,7 +1433,7 @@ class LanguageServer:
                 ):
                     incoming_symbol = containing_symbol
                     if include_self:
-                        result.append(containing_symbol)
+                        result.append(ReferenceInSymbol(symbol=containing_symbol, line=ref_line, character=ref_col))
                         continue
                     else:
                         self.logger.log(f"Found self-reference for {incoming_symbol['name']}, skipping it since {include_self=}", logging.DEBUG)
@@ -1426,7 +1455,7 @@ class LanguageServer:
                     )
                     continue
 
-                result.append(containing_symbol)
+                result.append(ReferenceInSymbol(symbol=containing_symbol, line=ref_line, character=ref_col))
 
         return result
 
@@ -1513,11 +1542,11 @@ class LanguageServer:
             column_condition = True
             if strict:
                 line_condition = end["line"] >= line > start["line"]
-                if column is not None:
+                if column is not None and line == start["line"]:
                     column_condition = column > start["character"]
             else:
                 line_condition = end["line"] >= line >= start["line"]
-                if column is not None:
+                if column is not None and line == start["line"]:
                     column_condition = column >= start["character"]
             return line_condition and column_condition
 
@@ -1552,12 +1581,16 @@ class LanguageServer:
 
     async def request_container_of_symbol(self, symbol: multilspy_types.UnifiedSymbolInformation, include_body: bool = False) -> multilspy_types.UnifiedSymbolInformation | None:
         """
-        Finds the container of the given symbol if there is one.
+        Finds the container of the given symbol if there is one. If the parent attribute is present, the parent is returned
+        without further searching.
 
         :param symbol: The symbol to find the container of.
         :param include_body: whether to include the body of the symbol in the result.
+        :return: The container of the given symbol or None if no container is found.
         """
-        assert "location" in symbol
+        if "parent" in symbol:
+            return symbol["parent"]
+        assert "location" in symbol, f"Symbol {symbol} has no location and no parent attribute"
         return await self.request_containing_symbol(
             symbol["location"]["relativePath"],
             symbol["location"]["range"]["start"]["line"],
@@ -1612,28 +1645,37 @@ class LanguageServer:
 
     @property
     def _cache_path(self) -> Path:
-        return Path(self.repository_root_path) / ".serena" / "cache" / "document_symbols_cache.pkl"
+        return Path(self.repository_root_path) / ".serena" / "cache" / "document_symbols_cache_v20-05-25.pkl"
 
     def save_cache(self):
-        if self._cache_has_changed:
+        with self._cache_lock:
+            if not self._cache_has_changed:
+                self.logger.log("No changes to document symbols cache, skipping save", logging.DEBUG)
+                return
+
             self.logger.log(f"Saving updated document symbols cache to {self._cache_path}", logging.INFO)
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with open(self._cache_path, "wb") as f:
                     pickle.dump(self._document_symbols_cache, f)
+                self._cache_has_changed = False
             except Exception as e:
                 self.logger.log(
-                        f"Failed to save document symbols cache to {self._cache_path}: {e}. "
-                        "Note: this may have resulted in a corrupted cache file.", logging.ERROR
-                    )
+                    f"Failed to save document symbols cache to {self._cache_path}: {e}. "
+                    "Note: this may have resulted in a corrupted cache file.",
+                    logging.ERROR,
+                )
 
     def load_cache(self):
         if not self._cache_path.exists():
             return
-        self.logger.log(f"Loading document symbols cache from {self._cache_path}", logging.INFO)
-        with open(self._cache_path, "rb") as f:
+
+        with self._cache_lock:
+            self.logger.log(f"Loading document symbols cache from {self._cache_path}", logging.INFO)
             try:
-                self._document_symbols_cache = pickle.load(f)
+                with open(self._cache_path, "rb") as f:
+                    self._document_symbols_cache = pickle.load(f)
+                self.logger.log(f"Loaded {len(self._document_symbols_cache)} document symbols from cache.", logging.INFO)   
             except Exception as e:
                 # cache often becomes corrupt, so just skip loading it
                 self.logger.log(
@@ -1734,7 +1776,7 @@ class LanguageServer:
 
         :param query: The query string to filter symbols by
 
-        :return Union[List[multilspy_types.UnifiedSymbolInformation], None]: A list of matching symbols
+        :return: A list of matching symbols
         """
         response = await self.server.send.workspace_symbol({"query": query})
         if response is None:
@@ -1763,7 +1805,7 @@ class SyncLanguageServer:
     It is used to communicate with Language Servers of different programming languages.
     """
 
-    def __init__(self, language_server: LanguageServer, timeout: Optional[int] = None):
+    def __init__(self, language_server: LanguageServer, timeout: Optional[float] = None):
         """
         :param language_server: the async language server being wrapped
         :param timeout: the timeout, in seconds, to use for requests to the language server.
@@ -1774,11 +1816,14 @@ class SyncLanguageServer:
         self.timeout = timeout
 
         self._server_context = None
+        
+        self._shutdown_lock = threading.Lock()
+        self._is_shutting_down = False
 
     @classmethod
     def create(
-        cls, config: MultilspyConfig, logger: MultilspyLogger, repository_root_path: str, add_gitignore_content_to_config=True,
-        timeout: Optional[int] = None
+        cls, config: MultilspyConfig, logger: MultilspyLogger, repository_root_path: str,
+        timeout: Optional[float] = None
     ) -> "SyncLanguageServer":
         """
         Creates a language specific LanguageServer instance based on the given configuration, and appropriate settings for the programming language.
@@ -1788,14 +1833,16 @@ class SyncLanguageServer:
         :param repository_root_path: The root path of the repository (must be absolute).
         :param config: The Multilspy configuration.
         :param logger: The logger to use.
-        :param add_gitignore_content_to_config: whether to add the content of the .gitignore file (if any found) to the config, so that
-            the paths ignored there are also ignored by the language server
         :param timeout: the timeout, in seconds, to use for requests; if None, use no timeout
 
         :return SyncLanguageServer: A language specific LanguageServer instance.
         """
-        return SyncLanguageServer(LanguageServer.create(config, logger, repository_root_path, add_gitignore_content_to_config=add_gitignore_content_to_config), timeout=timeout)
+        return SyncLanguageServer(LanguageServer.create(config, logger, repository_root_path), timeout=timeout)
 
+    @property
+    def repository_root_path(self) -> str:
+        return self.language_server.repository_root_path
+    
     @contextmanager
     def open_file(self, relative_file_path: str) -> Iterator[LSPFileBuffer]:
         """
@@ -1844,9 +1891,7 @@ class SyncLanguageServer:
         ctx = self.language_server.start_server()
         asyncio.run_coroutine_threadsafe(ctx.__aenter__(), loop=self.loop).result()
         yield self
-        asyncio.run_coroutine_threadsafe(ctx.__aexit__(None, None, None), loop=self.loop).result()
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.loop_thread.join()
+        self.stop()
 
     def request_definition(self, file_path: str, line: int, column: int) -> List[multilspy_types.Location]:
         """
@@ -2099,9 +2144,7 @@ class SyncLanguageServer:
         return self.language_server.retrieve_symbol_body(symbol)
 
     def request_parsed_files(self) -> list[str]:
-        """This is slow, as it finds all files by finding all symbols.
-
-        This seems to be the only way, the LSP does not provide any endpoints for listing project files."""
+        """Retrieves relative paths of all files analyzed by the Language Server."""
         assert self.loop
         result = asyncio.run_coroutine_threadsafe(
             self.language_server.request_parsed_files(), self.loop
@@ -2113,7 +2156,7 @@ class SyncLanguageServer:
         include_imports: bool = True, include_self: bool = False,
         include_body: bool = False,
         include_file_symbols: bool = False,
-    ) -> List[multilspy_types.UnifiedSymbolInformation]:
+    ) -> List[ReferenceInSymbol]:
         """
         Finds all symbols that reference the symbol at the given location.
         This is similar to request_references but filters to only include symbols
@@ -2130,7 +2173,7 @@ class SyncLanguageServer:
         :param include_body: whether to include the body of the symbols in the result.
         :param include_file_symbols: whether to include references that are file symbols. This
             is often a fallback mechanism for when the reference cannot be resolved to a symbol.
-        :return: List of symbols that reference the target symbol.
+        :return: List of objects containing the symbol and the location of the reference.
         """
         assert self.loop
         result = asyncio.run_coroutine_threadsafe(
@@ -2267,11 +2310,16 @@ class SyncLanguageServer:
 
         :return: self for method chaining
         """
+        self.language_server.logger.log(f"Starting language server with language {self.language_server.language} for {self.language_server.repository_root_path}", logging.INFO)
+        self.language_server.logger.log("Creating new event loop", logging.DEBUG)
         self.loop = asyncio.new_event_loop()
+        self.language_server.logger.log("Creating new thread for event loop", logging.DEBUG)
         self.loop_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.loop_thread.start()
+        self.language_server.logger.log("Starting server (async) context", logging.DEBUG)
         self._server_context = self.language_server.start_server()
-        asyncio.run_coroutine_threadsafe(self._server_context.__aenter__(), loop=self.loop).result()
+        self.language_server.logger.log("Entering server context", logging.DEBUG)
+        asyncio.run_coroutine_threadsafe(self._server_context.__aenter__(), loop=self.loop).result(timeout=self.timeout)
         return self
 
     def is_running(self) -> bool:
@@ -2279,24 +2327,124 @@ class SyncLanguageServer:
         Check if the language server is running.
         """
         return self.loop is not None and self.loop_thread is not None and self.loop_thread.is_alive()
+    
+    async def _shutdown_and_stop_loop(self):
+        """A coroutine that performs the full shutdown and then stops the event loop."""
+        try:
+            if self._server_context:
+                await self._server_context.__aexit__(None, None, None)
+        except Exception as e:
+            self.language_server.logger.log(f"Exception during async shutdown: {e}", logging.ERROR)
+        finally:
+            # Clean up tasks but DON'T stop the loop from here
+            # Let the main thread handle loop stopping to avoid coroutine deadlocks
+            if self.loop and self.loop.is_running():
+                current_task = asyncio.current_task(self.loop)
+                pending_tasks = [task for task in asyncio.all_tasks(self.loop) 
+                               if not task.done() and task is not current_task]
+                
+                if pending_tasks:
+                    self.language_server.logger.log(f"Cancelling {len(pending_tasks)} pending tasks", logging.DEBUG)
+                    for task in pending_tasks:
+                        try:
+                            task.cancel()
+                        except Exception:
+                            pass
+                
+                self.language_server.logger.log("Async shutdown tasks completed, returning to main thread", logging.DEBUG)
+                # Note: NOT calling loop.stop() here - let main thread do it
 
-    def stop(self) -> None:
+    def stop(self, shutdown_timeout: float = 5.0) -> None:
         """
-        Shuts down the language server process and cleans up resources.
-
-        If the language server is not running, this method will log a warning and do nothing.
+        Stops the language server and robustly cleans up all associated resources,
+        including the asyncio event loop, to prevent hangs on process exit.
         """
+        # 1. Use a lock and flag to make the shutdown call thread-safe and idempotent,
+        # ensuring the shutdown logic runs only once.
+        with self._shutdown_lock:
+            if self._is_shutting_down:
+                self.language_server.logger.log("Already shutting down or stopped, skipping", logging.DEBUG)
+                return
+            self._is_shutting_down = True
+    
         if not self.is_running():
-            self.language_server.logger.log("Language server not running, skipping shutdown.", logging.INFO)
+            self.language_server.logger.log("Language server is not running, skipping", logging.DEBUG)
             return
-
-        assert self.loop
-        asyncio.run_coroutine_threadsafe(self._server_context.__aexit__(None, None, None), loop=self.loop).result()
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.loop_thread.join()
+    
+        self.language_server.logger.log("Initiating server shutdown...", logging.INFO)
+        self.save_cache()
+        
+        # Detect platform to choose shutdown strategy
+        is_windows = os.name == "nt"
+        
+        if not is_windows:
+            # 2. Graceful shutdown for Linux/Unix - try proper async cleanup first
+            shutdown_future = None
+            if self.loop and self.loop.is_running():
+                shutdown_future = asyncio.run_coroutine_threadsafe(self._shutdown_and_stop_loop(), self.loop)
+            
+            # 3. Wait for the background thread to exit
+            if self.loop_thread:
+                self.loop_thread.join(timeout=shutdown_timeout)
+                if self.loop_thread.is_alive():
+                    self.language_server.logger.log("Event loop thread did not terminate within timeout", logging.WARNING)
+            
+            # 4. Wait for the shutdown coroutine to complete if it was scheduled
+            if shutdown_future:
+                try:
+                    shutdown_future.result(timeout=2.0)
+                    self.language_server.logger.log("Graceful async shutdown completed", logging.DEBUG)
+                except Exception as e:
+                    self.language_server.logger.log(f"Async shutdown failed: {e}", logging.WARNING)
+            
+            # 5. Close the loop properly after graceful shutdown
+            if self.loop and not self.loop.is_closed():
+                try:
+                    self.loop.close()
+                    self.language_server.logger.log("Event loop closed successfully", logging.DEBUG)
+                except Exception as e:
+                    self.language_server.logger.log(f"Event loop close failed: {e}", logging.WARNING)
+        
+        else:
+            # WINDOWS NUCLEAR OPTION: Skip graceful shutdown - go straight to nuclear
+            # Windows IocpProactor has too many issues with proper cleanup
+            self.language_server.logger.log("Windows detected - using nuclear shutdown to prevent zombies", logging.WARNING)
+            
+            # Force stop the loop immediately without waiting for async cleanup
+            if self.loop and self.loop.is_running():
+                try:
+                    self.loop.call_soon_threadsafe(lambda: setattr(self.loop, '_stopping', True))
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                except Exception:
+                    pass
+                
+                # Force mark loop as closed IMMEDIATELY to prevent zombies
+                try:
+                    if hasattr(self.loop, '_closed'):
+                        self.loop._closed = True
+                    if hasattr(self.loop, '_stopping'):
+                        self.loop._stopping = True
+                    if hasattr(self.loop, '_ready'):
+                        self.loop._ready.clear()
+                except Exception:
+                    pass
+            
+            # Give thread minimal time to exit, then abandon it
+            if self.loop_thread:
+                self.loop_thread.join(timeout=1.0)  # Only 1 second on Windows
+                if self.loop_thread.is_alive():
+                    self.language_server.logger.log("Thread stuck - abandoning to prevent GC deadlock", logging.WARNING)
+    
+        # 6. Null out everything immediately - same for both platforms
         self.loop = None
         self.loop_thread = None
-        self.save_cache()
+        self._server_context = None
+        self._is_shutting_down = False
+        
+        shutdown_type = "Nuclear" if is_windows else "Graceful"
+        self.language_server.logger.log(f"{shutdown_type} shutdown complete - all references cleared", logging.INFO)
+
+
 
     def save_cache(self):
         """
@@ -2325,7 +2473,7 @@ class SyncLanguageServer:
 
     def get_ignore_spec(self) -> pathspec.PathSpec:
         """Returns the pathspec matcher for the paths that were configured to be ignored through
-        the multilspy config file and the .gitignore file.
+        the multilspy config.
 
         This is is a subset of the full language-specific ignore spec that determines
         which files are relevant for the language server.

@@ -1,10 +1,4 @@
-__version__ = "2025-04-07"
-
-
-def serena_root_path() -> str:
-    from pathlib import Path
-
-    return str(Path(__file__).parent.parent.parent.absolute())
+__version__ = "2025-05-21"
 
 
 def serena_version() -> str:

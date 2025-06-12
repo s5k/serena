@@ -34,7 +34,7 @@ import json
 import logging
 import os
 import psutil
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from .lsp_requests import LspNotification, LspRequest
 from .lsp_types import ErrorCodes
@@ -184,7 +184,7 @@ class LanguageServerHandler:
     def __init__(
         self,
         process_launch_info: ProcessLaunchInfo,
-        logger=None,
+        logger: Optional[Callable[[str, str, StringDict | str], None]] = None,
         start_independent_lsp_process=True,
     ) -> None:
         """
@@ -209,6 +209,12 @@ class LanguageServerHandler:
         self.task_counter = 0
         self.loop = None
         self.start_independent_lsp_process = start_independent_lsp_process
+        
+    def is_running(self) -> bool:
+        """
+        Checks if the language server process is currently running.
+        """
+        return self.process is not None and self.process.returncode is None
 
     async def start(self) -> None:
         """
@@ -242,6 +248,7 @@ class LanguageServerHandler:
         self.task_counter += 1
         self.tasks[self.task_counter] = self.loop.create_task(self.run_forever_stderr())
         self.task_counter += 1
+        
 
     async def stop(self) -> None:
         """
@@ -357,20 +364,24 @@ class LanguageServerHandler:
         """
         Perform the shutdown sequence for the client, including sending the shutdown request to the server and notifying it of exit
         """
+        self._log("Sending shutdown request to server")
         await self.send.shutdown()
+        self._log("Received shutdown response from server")
         self._received_shutdown = True
+        self._log("Sending exit notification to server")
         self.notify.exit()
+        self._log("Sent exit notification to server")
         if self.process and self.process.stdout:
             self.process.stdout.set_exception(StopLoopException())
             # This yields the control to the event loop to allow the exception to be handled
             # in the run_forever and run_forever_stderr methods
             await asyncio.sleep(0)
 
-    def _log(self, message: str) -> None:
+    def _log(self, message: str | StringDict) -> None:
         """
         Create a log message
         """
-        if self.logger:
+        if self.logger is not None:
             self.logger("client", "logger", message)
 
     async def run_forever(self) -> bool:
@@ -470,7 +481,7 @@ class LanguageServerHandler:
         )
         self.task_counter += 1
 
-    async def send_request(self, method: str, params: Optional[dict] = None) -> None:
+    async def send_request(self, method: str, params: Optional[dict] = None) -> PayloadLike:
         """
         Send request to the server, register the request id, and wait for the response
         """
@@ -480,9 +491,12 @@ class LanguageServerHandler:
         self._response_handlers[request_id] = request
         async with request.cv:
             await self._send_payload(make_request(method, request_id, params))
+            self._log(f"Waiting for asyncio condition for request {method} with params:\n{params}")
             await request.cv.wait()
+        self._log(f"Finished waiting, processing result")
         if isinstance(request.error, Error):
             raise MultilspyException(f"Could not process request {method} with params:\n{params}.\n  Language server error: {request.error}") from request.error
+        self._log(f"Returning non-error result, which is:\n{request.result}")
         return request.result
 
     def _send_payload_sync(self, payload: StringDict) -> None:
@@ -502,9 +516,8 @@ class LanguageServerHandler:
         """
         if not self.process or not self.process.stdin:
             return
+        self._log(payload)
         msg = create_message(payload)
-        if self.logger:
-            self.logger("client", "server", payload)
         self.process.stdin.writelines(msg)
         await self.process.stdin.drain()
 

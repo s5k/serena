@@ -14,8 +14,9 @@ from agno.tools.toolkit import Toolkit
 from dotenv import load_dotenv
 from sensai.util.logging import LogTime
 
-from serena import serena_root_path
 from serena.agent import SerenaAgent, Tool, show_fatal_exception_safe
+from serena.config import SerenaAgentContext
+from serena.constants import REPO_ROOT
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ log = logging.getLogger(__name__)
 class SerenaAgnoToolkit(Toolkit):
     def __init__(self, serena_agent: SerenaAgent):
         super().__init__("Serena")
-        for tool in serena_agent.get_exposed_tools():
+        for tool in serena_agent.get_exposed_tool_instances():
             self.functions[tool.get_name()] = self._create_agno_function(tool)
         log.info("Agno agent functions: %s", list(self.functions.keys()))
 
@@ -64,23 +65,37 @@ class SerenaAgnoAgentProvider:
                 return cls._agent
 
             # change to Serena root
-            os.chdir(serena_root_path())
+            os.chdir(REPO_ROOT)
 
             load_dotenv()
 
             parser = argparse.ArgumentParser(description="Serena coding assistant")
-            parser.add_argument(
-                "--project-file", required=False, help="Path to the project file, either absolute or relative to the root directory"
+
+            # Create a mutually exclusive group
+            group = parser.add_mutually_exclusive_group()
+
+            # Add arguments to the group, both pointing to the same destination
+            group.add_argument(
+                "--project-file",
+                required=False,
+                help="Path to the project (or project.yml file).",
+            )
+            group.add_argument(
+                "--project",
+                required=False,
+                help="Path to the project (or project.yml file).",
             )
             args = parser.parse_args()
 
-            if args.project_file:
-                project_file = Path(args.project_file).resolve()
+            args_project_file = args.project or args.project_file
+
+            if args_project_file:
+                project_file = Path(args_project_file).resolve()
                 # If project file path is relative, make it absolute by joining with project root
                 if not project_file.is_absolute():
                     # Get the project root directory (parent of scripts directory)
-                    project_root = Path(serena_root_path())
-                    project_file = project_root / args.project_file
+                    project_root = Path(REPO_ROOT)
+                    project_file = project_root / args_project_file
 
                 # Ensure the path is normalized and absolute
                 project_file = str(project_file.resolve())
@@ -89,7 +104,7 @@ class SerenaAgnoAgentProvider:
 
             with LogTime("Loading Serena agent"):
                 try:
-                    serena_agent = SerenaAgent(project_file)
+                    serena_agent = SerenaAgent(project_file, context=SerenaAgentContext.load("agent"))
                 except Exception as e:
                     show_fatal_exception_safe(e)
                     raise
@@ -117,7 +132,7 @@ class SerenaAgnoAgentProvider:
                 # To see detailed logs, you should use the serena logger (configure it in the project file path)
                 show_tool_calls=False,
                 markdown=True,
-                system_message=serena_agent.prompt_factory.create_system_prompt(),
+                system_message=serena_agent.create_system_prompt(),
                 telemetry=False,
                 memory=AgentMemory(),
                 add_history_to_messages=True,

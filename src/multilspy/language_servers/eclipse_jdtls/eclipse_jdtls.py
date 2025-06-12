@@ -165,7 +165,7 @@ class EclipseJDTLS(LanguageServer):
         """
         platformId = PlatformUtils.get_platform_id()
 
-        with open(str(PurePath(os.path.dirname(__file__), "runtime_dependencies.json")), "r") as f:
+        with open(str(PurePath(os.path.dirname(__file__), "runtime_dependencies.json")), "r", encoding="utf-8") as f:
             runtimeDependencies = json.load(f)
             del runtimeDependencies["_description"]
 
@@ -264,7 +264,7 @@ class EclipseJDTLS(LanguageServer):
         Returns the initialize parameters for the EclipseJDTLS server.
         """
         # Look into https://github.com/eclipse/eclipse.jdt.ls/blob/master/org.eclipse.jdt.ls.core/src/org/eclipse/jdt/ls/core/internal/preferences/Preferences.java to understand all the options available
-        with open(str(PurePath(os.path.dirname(__file__), "initialize_params.json")), "r") as f:
+        with open(str(PurePath(os.path.dirname(__file__), "initialize_params.json")), "r", encoding="utf-8") as f:
             d: InitializeParams = json.load(f)
 
         del d["_description"]
@@ -300,10 +300,10 @@ class EclipseJDTLS(LanguageServer):
         d["initializationOptions"]["bundles"] = bundles
 
         assert d["initializationOptions"]["settings"]["java"]["configuration"]["runtimes"] == [
-            {"name": "JavaSE-17", "path": "static/vscode-java/extension/jre/17.0.8.1-linux-x86_64", "default": True}
+            {"name": "JavaSE-21", "path": "static/vscode-java/extension/jre/21.0.7-linux-x86_64", "default": True}
         ]
         d["initializationOptions"]["settings"]["java"]["configuration"]["runtimes"] = [
-            {"name": "JavaSE-17", "path": self.runtime_dependency_paths.jre_home_path, "default": True}
+            {"name": "JavaSE-21", "path": self.runtime_dependency_paths.jre_home_path, "default": True}
         ]
 
         for runtime in d["initializationOptions"]["settings"]["java"]["configuration"]["runtimes"]:
@@ -420,6 +420,3 @@ class EclipseJDTLS(LanguageServer):
             await self.service_ready_event.wait()
 
             yield self
-
-            await self.server.shutdown()
-            await self.server.stop()

@@ -1,6 +1,46 @@
 # Latest
+Status of the main branch. Changes prior to the next official version change will appear here.
 
-Changes prior to the next official version change will appear here.
+## Highlights
+
+### This version is a major change and improvement of Serena
+
+* **Overhaul and major improvement of editing tools!**
+  This represents a very important change in Serena. Symbols can now be addressed by their `name_path` (including nested ones)
+  and we introduced a regex-based replaced tools. We tuned the prompts and tested the new editing mechanism.
+  It is much more reliable, flexible, and at the same time uses fewer tokens.
+  The line-replacement tools are disabled by default and deprecated, we will likely remove them soon.
+* **Better multi-project support and zero-config setup**: We significantly simplified the config setup, you no longer need to manually
+  create `project.yaml` for each project. Project activation is now always available. 
+  Any project can now be activated by just asking the LLM to do so and passing the path to a repo.
+* Dashboard as web app and possibility to shut down Serena from it (or the old log GUI).
+* Initial prompt for project supported (has to be added manually for the moment)
+* Massive performance improvement of pattern search tool
+
+# 2025-05-24
+
+## Highlights
+
+Important new feature: configurability of mode and context, allowing better integration in a variety of clients.
+See corresponding section in readme - Serena can now be integrated in IDE assistants in a more productive way.
+
+You can now also do things like switching to one-shot planning mode, ask to plan something (which will create a memory),
+then switch to interactive editing mode in the next conversation and work through the plan read from the memory.
+
+Also some improvements to prompts.
+
+# 2025-05-21
+
+**Signficant improvement in symbol finding!**
+
+* Serena core:
+    * `FindSymbolTool` now can look for symbols by specifying paths to them, not just the symbol name
+* Language Servers:
+    * Fixed `gopls` initialization
+    * Symbols retrieved through the symbol tree or through overview methods now are linked to their parents
+
+
+# 2025-05-19
 
 * Serena core:
     * Bugfix in `FindSymbolTool` (a bug fixed in LS)
@@ -17,6 +57,7 @@ Changes prior to the next official version change will appear here.
 * Language Servers:
     * Add further file extensions considered by the language servers for Python (.pyi), JavaScript (.jsx) and TypeScript (.tsx, .jsx)
     * Updated multilspy, adding support for Kotlin, Dart and C/C++ and several improvements.
+    * Added support for PHP
     
 
 # 2025-04-07
