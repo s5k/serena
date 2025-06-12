@@ -1,5 +1,5 @@
 """
-Provides PHP specific instantiation of the LanguageServer class using Intelephense.
+Provides PHP specific instantiation of the LanguageServer class using PHPActor.
 """
 
 import asyncio
@@ -11,7 +11,6 @@ import subprocess
 import pathlib
 import stat
 from contextlib import asynccontextmanager
-from time import sleep
 from typing import AsyncIterator
 
 from overrides import override
@@ -19,7 +18,7 @@ from overrides import override
 from multilspy.multilspy_logger import MultilspyLogger
 from multilspy.language_server import LanguageServer
 from multilspy.lsp_protocol_handler.server import ProcessLaunchInfo
-from multilspy.lsp_protocol_handler.lsp_types import DefinitionParams, InitializeParams
+from multilspy.lsp_protocol_handler.lsp_types import InitializeParams
 from multilspy.multilspy_config import MultilspyConfig
 from multilspy.multilspy_utils import PlatformUtils, PlatformId
 
@@ -33,9 +32,9 @@ else:
         def getpwuid(uid):
             return type('obj', (), {'pw_name': os.environ.get('USERNAME', 'unknown')})()
 
-class Intelephense(LanguageServer):
+class PHPActor(LanguageServer):
     """
-    Provides PHP specific instantiation of the LanguageServer class using Intelephense.
+    Provides PHP specific instantiation of the LanguageServer class using PHPActor.
     """
     
     @override
@@ -48,7 +47,7 @@ class Intelephense(LanguageServer):
 
     def setup_runtime_dependencies(self, logger: MultilspyLogger, config: MultilspyConfig) -> str:
         """
-        Setup runtime dependencies for Intelephense.
+        Setup runtime dependencies for PHPActor.
         """
         platform_id = PlatformUtils.get_platform_id()
 
@@ -63,22 +62,25 @@ class Intelephense(LanguageServer):
         ]
         assert platform_id in valid_platforms, f"Platform {platform_id} is not supported for multilspy PHP at the moment"
 
-        with open(os.path.join(os.path.dirname(__file__), "runtime_dependencies.json"), "r", encoding="utf-8") as f:
+        with open(os.path.join(os.path.dirname(__file__), "runtime_dependencies.json"), "r") as f:
             d = json.load(f)
             del d["_description"]
 
         runtime_dependencies = d.get("runtimeDependencies", [])
-        intelephense_ls_dir = os.path.join(os.path.dirname(__file__), "static", "php-lsp")
+        phpactor_ls_dir = os.path.join(os.path.dirname(__file__), "static", "phpactor")
         
-        # Verify both node and npm are installed
-        is_node_installed = shutil.which('node') is not None
-        assert is_node_installed, "node is not installed or isn't in PATH. Please install NodeJS and try again."
-        is_npm_installed = shutil.which('npm') is not None
-        assert is_npm_installed, "npm is not installed or isn't in PATH. Please install npm and try again."
+        # Check if PHP is installed
+        is_php_installed = shutil.which('php') is not None
+        assert is_php_installed, "PHP is not installed or isn't in PATH. Please install PHP and try again."
+        
+        # Check if Composer is installed (optional but recommended)
+        is_composer_installed = shutil.which('composer') is not None
+        if not is_composer_installed:
+            logger.log("Composer is not installed. Some features may not work correctly.", logging.WARNING)
 
-        # Install intelephense if not already installed
-        if not os.path.exists(intelephense_ls_dir):
-            os.makedirs(intelephense_ls_dir, exist_ok=True)
+        # Install phpactor if not already installed
+        if not os.path.exists(phpactor_ls_dir):
+            os.makedirs(phpactor_ls_dir, exist_ok=True)
             for dependency in runtime_dependencies:
                 # Windows doesn't support the 'user' parameter and doesn't have pwd module
                 if PlatformUtils.get_platform_id().value.startswith("win"):
@@ -86,7 +88,7 @@ class Intelephense(LanguageServer):
                         dependency["command"],
                         shell=True,
                         check=True,
-                        cwd=intelephense_ls_dir,
+                        cwd=phpactor_ls_dir,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
@@ -98,25 +100,33 @@ class Intelephense(LanguageServer):
                         shell=True,
                         check=True,
                         user=user,
-                        cwd=intelephense_ls_dir,
+                        cwd=phpactor_ls_dir,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
         
-        intelephense_executable_path = os.path.join(intelephense_ls_dir, "node_modules", ".bin", "intelephense")
-        assert os.path.exists(intelephense_executable_path), "intelephense executable not found. Please install intelephense and try again."
+        phpactor_executable_path = os.path.join(phpactor_ls_dir, "bin", "phpactor")
         
-        return f"{intelephense_executable_path} --stdio"
+        # Make sure the phpactor binary is executable
+        if not os.path.exists(phpactor_executable_path):
+            raise FileNotFoundError(f"PHPActor executable not found at {phpactor_executable_path}")
+        
+        # Make the phpactor binary executable on Unix-like systems
+        if not os.name == 'nt':
+            os.chmod(phpactor_executable_path, os.stat(phpactor_executable_path).st_mode | stat.S_IEXEC)
+        
+        # Use the language-server command with stdio
+        return f"{phpactor_executable_path} language-server"
 
     def __init__(self, config: MultilspyConfig, logger: MultilspyLogger, repository_root_path: str):
         # Setup runtime dependencies before initializing
-        intelephense_cmd = self.setup_runtime_dependencies(logger, config)
+        phpactor_cmd = self.setup_runtime_dependencies(logger, config)
         
         super().__init__(
             config,
             logger,
             repository_root_path,
-            ProcessLaunchInfo(cmd=intelephense_cmd, cwd=repository_root_path),
+            ProcessLaunchInfo(cmd=phpactor_cmd, cwd=repository_root_path),
             "php"
         )
         self.server_ready = asyncio.Event()
@@ -124,9 +134,9 @@ class Intelephense(LanguageServer):
 
     def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
         """
-        Returns the initialize params for the TypeScript Language Server.
+        Returns the initialize params for the PHPActor Language Server.
         """
-        with open(os.path.join(os.path.dirname(__file__), "initialize_params.json"), "r", encoding="utf-8") as f:
+        with open(os.path.join(os.path.dirname(__file__), "initialize_params.json"), "r") as f:
             d = json.load(f)
 
         del d["_description"]
@@ -147,8 +157,8 @@ class Intelephense(LanguageServer):
         return d
 
     @asynccontextmanager
-    async def start_server(self) -> AsyncIterator["Intelephense"]:
-        """Start Intelephense server process"""
+    async def start_server(self) -> AsyncIterator["PHPActor"]:
+        """Start PHPActor server process"""
         async def register_capability_handler(params):
             return
 
@@ -161,10 +171,10 @@ class Intelephense(LanguageServer):
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_notification("window/logMessage", window_log_message)
         self.server.on_notification("$/progress", do_nothing)
-        self.server.on_notification("textDocument/publishDiagnostics", self.handle_publish_diagnostics)
+        self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
 
         async with super().start_server():
-            self.logger.log("Starting Intelephense server process", logging.INFO)
+            self.logger.log("Starting PHPActor server process", logging.INFO)
             await self.server.start()
             initialize_params = self._get_initialize_params(self.repository_root_path)
 
@@ -186,25 +196,11 @@ class Intelephense(LanguageServer):
             self.server.notify.initialized({})
             self.completions_available.set()
 
-            # Intelephense server is typically ready immediately after initialization
+            # PHPActor server is typically ready immediately after initialization
             self.server_ready.set()
             await self.server_ready.wait()
 
             yield self
-            
-    @override
-    # For some reason, the LS may need longer to process this, so we just retry
-    async def _send_references_request(self, relative_file_path: str, line: int, column: int):
-        # TODO: The LS doesn't return references contained in other files if it doesn't sleep. This is
-        #   despite the LS having processed requests already. I don't know what causes this, but sleeping
-        #   one second helps. It may be that sleeping only once is enough but that's hard to reliably test.
-        # May be related to the time it takes to read the files or something like that.
-        # The sleeping doesn't seem to be needed on all systems
-        sleep(1)
-        return await super()._send_references_request(relative_file_path, line, column)
-    
-    @override
-    async def _send_definition_request(self, definition_params: DefinitionParams):
-        # TODO: same as above, also only a problem if the definition is in another file
-        sleep(1)
-        return await super()._send_definition_request(definition_params)
+
+            await self.server.shutdown()
+            await self.server.stop()

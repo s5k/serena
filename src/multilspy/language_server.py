@@ -18,6 +18,8 @@ import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from copy import copy
+from typing import Any, Dict, List, Optional, Tuple, Union
+from fnmatch import fnmatch
 from pathlib import Path, PurePath
 import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union, cast
@@ -27,7 +29,7 @@ import pathspec
 from . import multilspy_types
 from .lsp_protocol_handler import lsp_types as LSPTypes
 from .lsp_protocol_handler.lsp_constants import LSPConstants
-from .lsp_protocol_handler.lsp_types import Definition, DefinitionParams, LocationLink, SymbolKind
+from .lsp_protocol_handler.lsp_types import Definition, DefinitionParams, LocationLink, Diagnostic, SymbolKind
 from .lsp_protocol_handler.server import (
     Error,
     LanguageServerHandler,
@@ -36,6 +38,10 @@ from .lsp_protocol_handler.server import (
 )
 from .multilspy_config import Language, MultilspyConfig
 from .multilspy_exceptions import MultilspyException
+from .multilspy_utils import PathUtils, FileUtils, TextUtils
+from .uri_path_mapper import UriPathMapper
+from pathlib import PurePath
+from typing import AsyncIterator, Iterator, List, Dict, Optional, Union, Tuple
 from .multilspy_logger import MultilspyLogger
 from .multilspy_utils import FileUtils, PathUtils, TextUtils
 from .type_helpers import ensure_all_methods_implemented
@@ -220,6 +226,7 @@ class LanguageServer:
 
         self.server_started = False
         self.completions_available = asyncio.Event()
+        self._diagnostics_store: Dict[str, List[Diagnostic]] = {}
         if config.trace_lsp_communication:
             def logging_fn(source: str, target: str, msg: StringDict | str):
                 self.logger.log(f"LSP: {source} -> {target}: {str(msg)}", logging.DEBUG)
@@ -240,6 +247,9 @@ class LanguageServer:
         self.open_file_buffers: Dict[str, LSPFileBuffer] = {}
 
         self.language = Language(language_id)
+        
+        # Create the URI-to-Path mapper with caching
+        self._path_mapper = UriPathMapper(self.repository_root_path, self.logger)
 
         # Set up the pathspec matcher for the ignored paths
         # for all absolute paths in ignored_paths, convert them to relative paths
@@ -255,6 +265,57 @@ class LanguageServer:
             pathspec.patterns.GitWildMatchPattern,
             processed_patterns
         )
+
+    def handle_publish_diagnostics(self, params: Dict[str, Any]) -> None:
+        """
+        Handle textDocument/publishDiagnostics notifications from the language server
+        
+        :param params: The notification parameters
+        """
+        try:
+            uri = params.get("uri", "")
+            diagnostics = params.get("diagnostics", [])
+            
+            # Convert URI to relative path
+            import urllib.parse
+            from pathlib import Path
+            
+            uri_path = urllib.parse.unquote(uri.replace("file://", ""))
+            repo_root = self.repository_root_path
+            
+            # Handle potential path differences between URI and repo root
+            try:
+                relative_path = os.path.relpath(uri_path, repo_root)
+                # Store the diagnostics
+                self._diagnostics_store[relative_path] = diagnostics
+                self.logger.log(f"Stored {len(diagnostics)} diagnostics for {relative_path}", logging.INFO)
+            except ValueError:
+                self.logger.log(f"URI path {uri_path} is not relative to repo root {repo_root}", logging.INFO)
+        except Exception as e:
+            self.logger.log(f"Error handling diagnostics notification: {e}", logging.INFO)
+
+    def get_diagnostics_for_file(self, relative_path: str) -> List[Diagnostic]:
+        """
+        Get diagnostics (errors and warnings) for a specific file
+        
+        :param relative_path: The relative path to the file
+        :return: List of diagnostics for the file
+        """
+        return self._diagnostics_store.get(relative_path, [])
+
+    def get_diagnostics_by_severity(self, relative_path: str, severity_levels: Optional[List[int]]) -> List[Diagnostic]:
+        """
+        Get diagnostics with a specific severity for a file.
+
+        :param relative_path: The relative path to the file.
+        :param severity_levels: A list of severity levels (1=Error, 2=Warning, 3=Info, 4=Hint).
+        :return: List of diagnostics with the specified severity.
+        """
+        all_diagnostics = self.get_diagnostics_for_file(relative_path)
+        if severity_levels is None:
+            return all_diagnostics
+
+        return [d for d in all_diagnostics if d.get("severity") in severity_levels]
 
     def get_ignore_spec(self) -> pathspec.PathSpec:
         """Returns the pathspec matcher for the paths that were configured to be ignored through
@@ -581,40 +642,41 @@ class LanguageServer:
             response = await self._send_definition_request(definition_params)
 
         ret: List[multilspy_types.Location] = []
+        
         if isinstance(response, list):
             # response is either of type Location[] or LocationLink[]
             for item in response:
                 assert isinstance(item, dict)
                 if LSPConstants.URI in item and LSPConstants.RANGE in item:
-                    new_item: multilspy_types.Location = {}
-                    new_item.update(item)
-                    new_item["absolutePath"] = PathUtils.uri_to_path(new_item["uri"])
-                    new_item["relativePath"] = PathUtils.get_relative_path(new_item["absolutePath"], self.repository_root_path)
-                    ret.append(multilspy_types.Location(new_item))
+                    # Standard Location object
+                    enriched_location = self._path_mapper.enrich_location(item)
+                    ret.append(multilspy_types.Location(**enriched_location))
                 elif (
                     LSPConstants.ORIGIN_SELECTION_RANGE in item
                     and LSPConstants.TARGET_URI in item
                     and LSPConstants.TARGET_RANGE in item
                     and LSPConstants.TARGET_SELECTION_RANGE in item
                 ):
-                    new_item: multilspy_types.Location = {}
-                    new_item["uri"] = item[LSPConstants.TARGET_URI]
-                    new_item["absolutePath"] = PathUtils.uri_to_path(new_item["uri"])
-                    new_item["relativePath"] = PathUtils.get_relative_path(new_item["absolutePath"], self.repository_root_path)
-                    new_item["range"] = item[LSPConstants.TARGET_SELECTION_RANGE]
-                    ret.append(multilspy_types.Location(**new_item))
+                    # LocationLink object
+                    new_item = {
+                        "uri": item[LSPConstants.TARGET_URI],
+                        "range": item[LSPConstants.TARGET_SELECTION_RANGE]
+                    }
+                    enriched_location = self._path_mapper.enrich_location(new_item)
+                    ret.append(multilspy_types.Location(**enriched_location))
                 else:
-                    assert False, f"Unexpected response from Language Server: {item}"
+                    # Skip items with unexpected format
+                    self.logger.log(f"Skipping item with unexpected format: {item}", logging.WARNING)
+                    continue
+                    
         elif isinstance(response, dict):
             # response is of type Location
             assert LSPConstants.URI in response
             assert LSPConstants.RANGE in response
-
-            new_item: multilspy_types.Location = {}
-            new_item.update(response)
-            new_item["absolutePath"] = PathUtils.uri_to_path(new_item["uri"])
-            new_item["relativePath"] = PathUtils.get_relative_path(new_item["absolutePath"], self.repository_root_path)
-            ret.append(multilspy_types.Location(**new_item))
+            
+            enriched_location = self._path_mapper.enrich_location(response)
+            ret.append(multilspy_types.Location(**enriched_location))
+            
         elif response is None:
             # Some language servers return None when they cannot find a definition
             # This is expected for certain symbol types like generics or types with incomplete information
@@ -624,7 +686,7 @@ class LanguageServer:
             )
         else:
             assert False, f"Unexpected response from Language Server: {response}"
-
+            
         return ret
 
     # Some LS cause problems with this, so the call is isolated from the rest to allow overriding in subclasses
@@ -659,7 +721,6 @@ class LanguageServer:
             )
             raise MultilspyException("Language Server not started")
 
-
         with self.open_file(relative_file_path):
             try:
                 response = await self._send_references_request(relative_file_path, line=line, column=column)
@@ -675,23 +736,27 @@ class LanguageServer:
             return []
 
         ret: List[multilspy_types.Location] = []
-        assert isinstance(response, list), f"Unexpected response from Language Server (expected list, got {type(response)}): {response}"
+        # Handle case where response is None
+        if response is None:
+            self.logger.log(f"No response from Language Server", logging.WARNING)
+            return ret
+            
+        assert isinstance(response, list), f"Unexpected response from Language Server: {response}"
+        
         for item in response:
             assert isinstance(item, dict), f"Unexpected response from Language Server (expected dict, got {type(item)}): {item}"
             assert LSPConstants.URI in item
             assert LSPConstants.RANGE in item
 
-            abs_path = PathUtils.uri_to_path(item[LSPConstants.URI])
-            rel_path = Path(abs_path).relative_to(self.repository_root_path)
-            if self.is_ignored_path(str(rel_path)):
-                self.logger.log(f"Ignoring reference in {rel_path} since it should be ignored", logging.DEBUG)
+            # Use the UriPathMapper to get the relative path
+            enriched_location = self._path_mapper.enrich_location(item)
+            
+            # Check if the path should be ignored
+            if "relativePath" in enriched_location and self.is_ignored_path(enriched_location["relativePath"]):
+                self.logger.log(f"Ignoring reference in {enriched_location['relativePath']} since it should be ignored", logging.DEBUG)
                 continue
 
-            new_item: multilspy_types.Location = {}
-            new_item.update(item)
-            new_item["absolutePath"] = str(abs_path)
-            new_item["relativePath"] = str(rel_path)
-            ret.append(multilspy_types.Location(**new_item))
+            ret.append(multilspy_types.Location(**enriched_location))
 
         return ret
 
@@ -869,76 +934,59 @@ class LanguageServer:
             )
             self.logger.log(f"Received {len(response) if response is not None else None} document symbols for {relative_file_path} from the Language Server", logging.DEBUG)
 
-        def turn_item_into_symbol_with_children(item: GenericDocumentSymbol):
-            item = cast(multilspy_types.UnifiedSymbolInformation, item)
-            absolute_path = os.path.join(self.repository_root_path, relative_file_path)
+        # Handle case where response is None
+        if response is None:
+            self.logger.log(f"No response from Language Server for document symbols request", logging.WARNING)
+            return ([], [])
             
-            # handle missing entries in location
-            if "location" not in item:
-                uri = pathlib.Path(absolute_path).as_uri()
-                assert "range" in item
-                tree_location = multilspy_types.Location(
-                    uri=uri,
-                    range=item['range'],
-                    absolutePath=absolute_path,
-                    relativePath=relative_file_path,
-                )
-                item['location'] = tree_location
-            location = item["location"]
-            if "absolutePath" not in location:
-                location["absolutePath"] = absolute_path
-            if "relativePath" not in location:
-                location["relativePath"] = relative_file_path
-            if include_body:
-                item['body'] = self.retrieve_symbol_body(item)
-            # handle missing selectionRange
-            if "selectionRange" not in item:
-                if "range" in item:
-                    item["selectionRange"] = item["range"]
-                else:
-                    item["selectionRange"] = item["location"]["range"]
-            children = item.get(LSPConstants.CHILDREN, [])
-            for child in children:
-                child["parent"] = item
-            item[LSPConstants.CHILDREN] = children
-
-        flat_all_symbol_list: List[multilspy_types.UnifiedSymbolInformation] = []
         assert isinstance(response, list), f"Unexpected response from Language Server: {response}"
-        root_nodes: List[multilspy_types.UnifiedSymbolInformation] = []
-        for root_item in response:
-            if "range" not in root_item and "location" not in root_item:
-                if root_item["kind"] in [SymbolKind.File, SymbolKind.Module]:
-                    ...
-
-            # mutation is more convenient than creating a new dict,
-            # so we cast and rename the var after the mutating call to turn_item_into_symbol_with_children
-            # which turned and item into a "symbol"
-            turn_item_into_symbol_with_children(root_item)
-            root_symbol = cast(multilspy_types.UnifiedSymbolInformation, root_item)
-            root_symbol["parent"] = None
+        
+        # Transform the response to add path information
+        enriched_response = []
+        for item in response:
+            # Process the symbol using our UriPathMapper
+            enriched_item = self._path_mapper.enrich_symbol(item, default_relative_path=relative_file_path)
             
-            root_nodes.append(root_symbol)
-            assert isinstance(root_symbol, dict)
-            assert LSPConstants.NAME in root_symbol
-            assert LSPConstants.KIND in root_symbol
-
-            if LSPConstants.CHILDREN in root_symbol:
-                # TODO: l_tree should be a list of TreeRepr. Define the following function to return TreeRepr as well
+            # Handle missing selectionRange which our mapper doesn't handle
+            if "selectionRange" not in enriched_item:
+                if "range" in enriched_item:
+                    enriched_item["selectionRange"] = enriched_item["range"]
+                elif "location" in enriched_item and "range" in enriched_item["location"]:
+                    enriched_item["selectionRange"] = enriched_item["location"]["range"]
+                    
+            # Ensure children attribute is present
+            enriched_item[LSPConstants.CHILDREN] = enriched_item.get(LSPConstants.CHILDREN, [])
+            
+            # Add body if requested
+            if include_body and "location" in enriched_item and "relativePath" in enriched_item["location"]:
+                enriched_item['body'] = self.retrieve_symbol_body(enriched_item)
                 
-                def visit_tree_nodes_and_build_tree_repr(node: GenericDocumentSymbol) -> List[multilspy_types.UnifiedSymbolInformation]:
+            enriched_response.append(enriched_item)
+            
+        # Build result with the same structure as before
+        flat_all_symbol_list: List[multilspy_types.UnifiedSymbolInformation] = []
+        root_nodes: List[multilspy_types.UnifiedSymbolInformation] = []
+        
+        for item in enriched_response:
+            item = cast(multilspy_types.UnifiedSymbolInformation, item)
+            root_nodes.append(item)
+            
+            # Add to flat list
+            if LSPConstants.CHILDREN in item and item[LSPConstants.CHILDREN]:
+                # Build flat list by traversing the tree
+                def visit_tree_nodes_and_build_flat_list(node: GenericDocumentSymbol) -> List[multilspy_types.UnifiedSymbolInformation]:
                     node = cast(multilspy_types.UnifiedSymbolInformation, node)
-                    l: List[multilspy_types.UnifiedSymbolInformation] = []
-                    turn_item_into_symbol_with_children(node)
-                    assert LSPConstants.CHILDREN in node
-                    children = node[LSPConstants.CHILDREN]
-                    l.append(node)
-                    for child in children:
-                        l.extend(visit_tree_nodes_and_build_tree_repr(child))
-                    return l
+                    result_list: List[multilspy_types.UnifiedSymbolInformation] = [node]
+                    
+                    if LSPConstants.CHILDREN in node:
+                        for child in node[LSPConstants.CHILDREN]:
+                            result_list.extend(visit_tree_nodes_and_build_flat_list(child))
+                            
+                    return result_list
                 
-                flat_all_symbol_list.extend(visit_tree_nodes_and_build_tree_repr(root_symbol))
+                flat_all_symbol_list.extend(visit_tree_nodes_and_build_flat_list(item))
             else:
-                flat_all_symbol_list.append(multilspy_types.UnifiedSymbolInformation(**root_symbol))
+                flat_all_symbol_list.append(multilspy_types.UnifiedSymbolInformation(**item))
 
         result = flat_all_symbol_list, root_nodes
         self.logger.log(f"Caching document symbols for {relative_file_path}", logging.DEBUG)
@@ -1051,6 +1099,7 @@ class LanguageServer:
                     # TODO: Not sure if this is actually still needed given recent changes to relative path handling
                     def fix_relative_path(nodes: List[multilspy_types.UnifiedSymbolInformation]):
                         for node in nodes:
+                            # Check if location and relativePath exist before trying to access them
                             if "location" in node and "relativePath" in node["location"]:
                                 path = Path(node["location"]["relativePath"])
                                 if path.is_absolute():
@@ -1630,11 +1679,95 @@ class LanguageServer:
             except Exception as e:
                 # cache often becomes corrupt, so just skip loading it
                 self.logger.log(
-                    f"Failed to load document symbols cache from {self._cache_path}: {e}. Possible cause: the cache file is corrupted. "
-                    "Check for any errors related to saving the cache in the logs.",
-                    logging.ERROR,
-                )
+                        f"Failed to load document symbols cache from {self._cache_path}: {e}. Possible cause: the cache file is corrupted. " 
+                        "Check for any errors related to saving the cache in the logs.",
+                        logging.ERROR
+                    )
 
+    async def request_document_diagnostic(
+        self, 
+        relative_file_path: str, 
+    ) -> Union[lsp_types.DocumentDiagnosticReport, None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :return: List of RelatedFullDocumentDiagnosticReport or RelatedUnchangedDocumentDiagnosticReport
+        """
+        if not self.server_started:
+            self.logger.log(
+                "request_code_action called before Language Server started",
+                loglevel=logging.WARNING,
+            )
+            return None
+
+        with self.open_file(relative_file_path):
+            code_action_params = lsp_types.DocumentDiagnosticParams(
+                textDocument=lsp_types.TextDocumentIdentifier(
+                    uri=pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()
+                ),
+            )
+            response = await self.server.send.text_document_diagnostic(code_action_params)
+        
+        if response is None:
+            return None
+            
+        return response
+
+    async def request_code_action(
+        self, 
+        relative_file_path: str, 
+        start_line: int, 
+        start_column: int,
+        end_line: int, 
+        end_column: int,
+        diagnostics: List[lsp_types.Diagnostic] = None
+    ) -> Union[List[Union[lsp_types.Command, lsp_types.CodeAction]], None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :param start_line: The 0-indexed start line number of the range
+        :param start_column: The 0-indexed start column number of the range
+        :param end_line: The 0-indexed end line number of the range
+        :param end_column: The 0-indexed end column number of the range
+        :param diagnostics: Optional list of diagnostics to include in the code action context
+        :return: List of commands or code actions, or None if no actions are available
+        """
+        if not self.server_started:
+            self.logger.log(
+                "request_code_action called before Language Server started",
+                loglevel=logging.WARNING,
+            )
+            return None
+
+        with self.open_file(relative_file_path):
+            code_action_params = lsp_types.CodeActionParams(
+                textDocument=lsp_types.TextDocumentIdentifier(
+                    uri=pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()
+                ),
+                range=lsp_types.Range(
+                    start=lsp_types.Position(line=start_line, character=start_column),
+                    end=lsp_types.Position(line=end_line, character=end_column)
+                ),
+                context=lsp_types.CodeActionContext(
+                    diagnostics=[]
+                    # diagnostics=[lsp_types.Diagnostic(
+                    #     range=lsp_types.Range(
+                    #         start=lsp_types.Position(line=start_line, character=start_column),
+                    #         end=lsp_types.Position(line=end_line, character=end_column)
+                    #     ),
+                    #     severity=1
+                    # )]
+                )
+            )
+            
+            response = await self.server.send.code_action(code_action_params)
+        
+        if response is None:
+            return None
+            
+        return response
 
     async def request_workspace_symbol(self, query: str) -> Union[List[multilspy_types.UnifiedSymbolInformation], None]:
         """
@@ -1651,15 +1784,17 @@ class LanguageServer:
 
         assert isinstance(response, list)
 
+        # Transform the response using our UriPathMapper to ensure relativePath information
         ret: List[multilspy_types.UnifiedSymbolInformation] = []
         for item in response:
             assert isinstance(item, dict)
-
             assert LSPConstants.NAME in item
             assert LSPConstants.KIND in item
             assert LSPConstants.LOCATION in item
 
-            ret.append(multilspy_types.UnifiedSymbolInformation(**item))
+            # Enrich the item with path information
+            enriched_item = self._path_mapper.enrich_symbol(item)
+            ret.append(multilspy_types.UnifiedSymbolInformation(**enriched_item))
 
         return ret
 
@@ -1926,6 +2061,60 @@ class SyncLanguageServer:
         """
         result = asyncio.run_coroutine_threadsafe(
             self.language_server.request_hover(relative_file_path, line, column), self.loop
+        ).result(timeout=self.timeout)
+        return result
+
+    def request_document_diagnostic(
+        self, 
+        relative_file_path: str, 
+    ) -> Union[List[lsp_types.DocumentDiagnosticReport], None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :return: List of RelatedFullDocumentDiagnosticReport or RelatedUnchangedDocumentDiagnosticReport
+        """
+        assert self.loop
+        result = asyncio.run_coroutine_threadsafe(
+            self.language_server.request_document_diagnostic(
+                relative_file_path=relative_file_path,
+            ),
+            self.loop
+        ).result(timeout=self.timeout)
+        return result
+
+
+    def request_code_action(
+        self, 
+        relative_file_path: str, 
+        start_line: int, 
+        start_column: int,
+        end_line: int, 
+        end_column: int,
+        diagnostics: List[lsp_types.Diagnostic] = None
+    ) -> Union[List[Union[lsp_types.Command, lsp_types.CodeAction]], None]:
+        """
+        Request code actions for the given range in the given file.
+        
+        :param relative_file_path: The relative path to the file
+        :param start_line: The 0-indexed start line number of the range
+        :param start_column: The 0-indexed start column number of the range
+        :param end_line: The 0-indexed end line number of the range
+        :param end_column: The 0-indexed end column number of the range
+        :param diagnostics: Optional list of diagnostics to include in the code action context
+        :return: List of commands or code actions, or None if no actions are available
+        """
+        assert self.loop
+        result = asyncio.run_coroutine_threadsafe(
+            self.language_server.request_code_action(
+                relative_file_path=relative_file_path,
+                start_line=start_line,
+                start_column=start_column,
+                end_line=end_line,
+                end_column=end_column,
+                diagnostics=diagnostics
+            ),
+            self.loop
         ).result(timeout=self.timeout)
         return result
 
@@ -2293,3 +2482,30 @@ class SyncLanguageServer:
         such as when searching for relevant non-language files in the project.
         """
         return self.language_server.get_ignore_spec()
+
+    def handle_publish_diagnostics(self, params: Dict[str, Any]) -> None:
+        """
+        Handle textDocument/publishDiagnostics notifications from the language server
+        
+        :param params: The notification parameters
+        """
+        return self.language_server.handle_publish_diagnostics(params)
+
+    def get_diagnostics_for_file(self, relative_path: str) -> List[Diagnostic]:
+        """
+        Get diagnostics (errors and warnings) for a specific file
+        
+        :param relative_path: The relative path to the file
+        :return: List of diagnostics for the file
+        """
+        return self.language_server.get_diagnostics_for_file(relative_path)
+
+    def get_diagnostics_by_severity(self, relative_path: str, severity_levels: Optional[List[int]]) -> List[Diagnostic]:
+        """
+        Get diagnostics with a specific severity for a file
+        
+        :param relative_path: The relative path to the file
+        :param severity_levels: The severity level (1=Error, 2=Warning, 3=Info, 4=Hint)
+        :return: List of diagnostics with the specified severity
+        """
+        return self.language_server.get_diagnostics_by_severity(relative_path, severity_levels)
