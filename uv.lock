@@ -894,6 +894,12 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/60/7b/a52523c8fbb34272c2e64154636f4a44ffa31d3e7cdd939e40434ffcacf3/ripgrepy-2.1.0.tar.gz", hash = "sha256:86b8ed6cf99da0bddab3281290078a3c3704c670c109afb37fd884485cf4a720", size = 31598 }
 
 [[package]]
+name = "ripgrepy"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/60/7b/a52523c8fbb34272c2e64154636f4a44ffa31d3e7cdd939e40434ffcacf3/ripgrepy-2.1.0.tar.gz", hash = "sha256:86b8ed6cf99da0bddab3281290078a3c3704c670c109afb37fd884485cf4a720", size = 31598 }
+
+[[package]]
 name = "rsa"
 version = "4.9"
 source = { registry = "https://pypi.org/simple" }
