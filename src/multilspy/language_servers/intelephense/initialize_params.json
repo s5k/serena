@@ -1,36 +1,82 @@
 {
-    "_description": "The parameters sent by the client when initializing the language server with the \"initialize\" request. More details at https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialize",
-    "processId": "os.getpid()",
-    "locale": "en",
-    "rootPath": "$rootPath",
-    "rootUri": "$rootUri",
-    "capabilities": {
-        "textDocument": {
-            "synchronization": {
-                "didSave": true,
-                "dynamicRegistration": true
-            },
-            "completion": {
-                "dynamicRegistration": true,
-                "completionItem": {
-                    "snippetSupport": true
-                }
-            },
-            "definition": {
-                "dynamicRegistration": true
-            }
+  "_description": "The parameters sent by the client when initializing the language server with the \"initialize\" request. More details at https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialize",
+  "processId": "os.getpid()",
+  "clientInfo": {
+    "name": "Visual Studio Code - Insiders",
+    "version": "1.82.0-insider"
+  },
+  "locale": "en",
+  "rootPath": "$rootPath",
+  "rootUri": "$rootUri",
+  "capabilities": {
+    "textDocument": {
+      "publishDiagnostics": {
+        "relatedInformation": true,
+        "versionSupport": false,
+        "tagSupport": {
+          "valueSet": [1, 2]
         },
-        "workspace": {
-            "workspaceFolders": true,
-            "didChangeConfiguration": {
-                "dynamicRegistration": true
-            }
-        }
+        "codeDescriptionSupport": true,
+        "dataSupport": true
+      },
+      "synchronization": {
+        "dynamicRegistration": true,
+        "willSave": true,
+        "willSaveWaitUntil": true,
+        "didSave": true
+      },
+      "diagnostic": {
+        "dynamicRegistration": true,
+        "relatedDocumentSupport": false
+      }
     },
-    "workspaceFolders": [
-        {
-            "uri": "$uri",
-            "name": "$name"
-        }
-    ]
+    "textDocumentSync": 2,
+    "documentSymbolProvider": true,
+    "workspaceSymbolProvider": true,
+    "completionProvider": {
+      "triggerCharacters": ["$", ">", ":", "\\", "/", "'", "\"", "*", ".", "<"],
+      "resolveProvider": true
+    },
+    "signatureHelpProvider": {
+      "triggerCharacters": ["(", ",", ":"]
+    },
+    "definitionProvider": true,
+    "documentFormattingProvider": false,
+    "documentRangeFormattingProvider": false,
+    "referencesProvider": true,
+    "hoverProvider": true,
+    "documentHighlightProvider": true,
+    "foldingRangeProvider": true,
+    "implementationProvider": true,
+    "declarationProvider": true,
+    "workspace": {
+      "workspaceFolders": {
+        "supported": true,
+        "changeNotifications": true
+      }
+    },
+    "renameProvider": {
+      "prepareProvider": true
+    },
+    "typeDefinitionProvider": true,
+    "selectionRangeProvider": true,
+    "codeActionProvider": true,
+    "executeCommandProvider": {
+      "commands": [
+        "intelephense.import.symbol",
+        "intelephense.implement.abstract.method.all",
+        "intelephense.phpdoc.add"
+      ]
+    },
+    "typeHierarchyProvider": true,
+    "codeLensProvider": {
+      "resolveProvider": true
+    }
+  },
+  "workspaceFolders": [
+    {
+      "uri": "$uri",
+      "name": "$name"
+    }
+  ]
 }

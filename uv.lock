@@ -888,6 +888,12 @@ wheels = [
 ]
 
 [[package]]
+name = "ripgrepy"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/60/7b/a52523c8fbb34272c2e64154636f4a44ffa31d3e7cdd939e40434ffcacf3/ripgrepy-2.1.0.tar.gz", hash = "sha256:86b8ed6cf99da0bddab3281290078a3c3704c670c109afb37fd884485cf4a720", size = 31598 }
+
+[[package]]
 name = "rsa"
 version = "4.9"
 source = { registry = "https://pypi.org/simple" }
@@ -986,6 +992,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "ruamel-yaml" },
+    { name = "ripgrepy" },
     { name = "sensai-utils" },
     { name = "types-pyyaml" },
 ]
@@ -1039,6 +1046,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "requests", specifier = ">=2.32.3,<3" },
     { name = "ruamel-yaml", specifier = ">=0.18.0" },
+    { name = "ripgrepy", specifier = ">=2.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.0.285" },
     { name = "sensai-utils", specifier = ">=1.4.0" },
     { name = "sqlalchemy", marker = "extra == 'agno'", specifier = ">=2.0.40" },

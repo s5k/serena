@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import sys
+import time
 import traceback
 import webbrowser
 from abc import ABC, abstractmethod
@@ -21,7 +22,7 @@ from functools import cached_property
 from logging import Logger
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, List, Optional, Self, TypeVar, Union, cast
 
 import yaml
 from overrides import override
@@ -32,6 +33,7 @@ from sensai.util.logging import FallbackHandler
 from sensai.util.string import ToStringMixin, dict_string
 
 from multilspy import SyncLanguageServer
+from multilspy.lsp_protocol_handler import lsp_types
 from multilspy.multilspy_config import Language, MultilspyConfig
 from multilspy.multilspy_logger import MultilspyLogger
 from multilspy.multilspy_types import SymbolKind
@@ -42,6 +44,8 @@ from serena.dashboard import MemoryLogHandler, SerenaDashboardAPI
 from serena.prompt_factory import PromptFactory, SerenaPromptFactory
 from serena.symbol import SymbolManager
 from serena.text_utils import search_files
+from serena.tools.ripgrepy_search import RipGrepySearch
+from serena.util.class_decorators import singleton
 from serena.util.file_system import GitignoreParser, match_path, scan_directory
 from serena.util.general import load_yaml, save_yaml
 from serena.util.inspection import determine_programming_language_composition, iter_subclasses
@@ -738,7 +742,6 @@ class SerenaAgent:
         self.symbol_manager = SymbolManager(self.language_server, self)
         self.memories_manager = MemoriesManagerMDFilesInProject(project.project_root)
         self.lines_read = LinesRead()
-
         if self._project_activation_callback is not None:
             self._project_activation_callback()
 
@@ -1344,6 +1347,57 @@ class FindSymbolTool(Tool):
         result = json.dumps(symbol_dicts)
         return self._limit_length(result, max_answer_chars)
 
+class GetDiagnosticsTool(Tool):
+    """
+    A tool for retrieving diagnostics information (e.g., errors, warnings) for a given file.
+
+    Performs a static analysis on the specified file path and returns a list of diagnostics,
+    such as syntax errors, type issues, and other code problems. Useful for identifying issues
+    prior to code edits or further analysis.
+    """
+
+    def apply(
+        self,
+        relative_file_path: str, 
+        severity_levels: Optional[List[int]],
+        max_answer_chars: int = _DEFAULT_MAX_ANSWER_LENGTH,
+    ) -> str:
+        """
+        Fetches diagnostics for a file and returns the results as a JSON string.
+
+        This method analyzes the specified file and gathers a list of diagnostic messages
+        (e.g., errors, warnings). The resulting diagnostics data can be used for informing
+        code modifications or for feeding into downstream tools. If the result exceeds
+        `max_answer_chars`, it is truncated.
+
+        :param relative_file_path: The relative path to the file
+        :param severity_levels: The severity level (1=Error, 2=Warning, 3=Info, 4=Hint)
+        :param max_answer_chars: Maximum number of characters allowed
+        :return: List of diagnostics for the file
+        """
+        with self.language_server.open_file(relative_file_path=relative_file_path):
+            self.language_server.insert_text_at_position(relative_file_path=relative_file_path, line=0, column=0, text_to_be_inserted="")
+            self.language_server.delete_text_between_positions(
+                relative_file_path=relative_file_path, 
+                start={"line": 0, "character": 0}, 
+                end={"line": 0, "character": 0}
+            )
+
+            time.sleep(2.5)
+
+            result_diagnostics = self.language_server.get_diagnostics_by_severity(
+                relative_path=relative_file_path,
+                severity_levels=severity_levels
+            )
+
+            if not result_diagnostics:
+                if severity_levels:
+                    return f"No diagnostics found for file '{relative_file_path}' with severities {severity_levels}."
+                else:
+                    return f"No diagnostics found for file '{relative_file_path}' (all severities checked)."
+
+            result = json.dumps(result_diagnostics)
+            return self._limit_length(result, max_answer_chars)
 
 class FindReferencingSymbolsTool(Tool):
     """
@@ -1866,7 +1920,7 @@ class SearchForPatternTool(Tool):
         context_lines_after: int = 0,
         paths_include_glob: str | None = None,
         paths_exclude_glob: str | None = None,
-        only_in_code_files: bool = True,
+        only_in_code_files: bool = False,
         max_answer_chars: int = _DEFAULT_MAX_ANSWER_LENGTH,
     ) -> str:
         """
@@ -1880,48 +1934,29 @@ class SearchForPatternTool(Tool):
         :param paths_include_glob: optional glob pattern specifying files to include in the search; if not provided, search globally.
         :param paths_exclude_glob: optional glob pattern specifying files to exclude from the search (takes precedence over paths_include_glob).
         :param only_in_code_files: whether to search only in code files or in the entire code base.
-            The explicitly ignored files (from serena config and gitignore) are never searched.
+            The explicitly ignored files (from serena config and gitignore, e.g: vendor or node_modules) are never searched.
         :param max_answer_chars: if the output is longer than this number of characters,
             no content will be returned. Don't adjust unless there is really no other way to get the content
             required for the task. Instead, if the output is too long, you should
             make a stricter query.
         :return: A JSON object mapping file paths to lists of matched consecutive lines (with context, if requested).
         """
-        if only_in_code_files:
-            matches = self.language_server.search_files_for_pattern(
-                pattern=pattern,
-                context_lines_before=context_lines_before,
-                context_lines_after=context_lines_after,
-                paths_include_glob=paths_include_glob,
-                paths_exclude_glob=paths_exclude_glob,
-            )
-        else:
-            # we walk through all files in the project starting from the root
-            files_to_search = []
-            for root, dirs, files in os.walk(self.get_project_root()):
-                # Don't go into directories that are ignored by modifying dirs inplace
-                # Explanation for the  + "/" part:
-                # pathspec can't handle the matching of directories if they don't end with a slash!
-                # see https://github.com/cpburnz/python-pathspec/issues/89
-                dirs[:] = [d for d in dirs if not self.agent.path_is_gitignored(os.path.join(root, d))]
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    if not self.agent.path_is_gitignored(file_path):
-                        files_to_search.append(file_path)
-            # TODO (maybe): not super efficient to walk through the files again and filter if glob patterns are provided
-            #   but it probably never matters and this version required no further refactoring
-            matches = search_files(
-                files_to_search,
-                pattern,
-                paths_include_glob=paths_include_glob,
-                paths_exclude_glob=paths_exclude_glob,
-            )
-        # group matches by file
-        file_to_matches: dict[str, list[str]] = defaultdict(list)
-        for match in matches:
-            assert match.source_file_path is not None
-            file_to_matches[match.source_file_path].append(match.to_display_string())
-        result = json.dumps(file_to_matches)
+
+        # Create the search tool
+        search_tool = RipGrepySearch()
+
+        # Perform a search
+        rp_results = search_tool.search(
+            pattern=pattern,
+            path=self.project_root,
+            context_lines_before=context_lines_before,
+            context_lines_after=context_lines_after,
+            paths_include_glob=paths_include_glob,
+            paths_exclude_glob=paths_exclude_glob,
+            include_gitignore=only_in_code_files
+        )
+
+        result = json.dumps(rp_results)
         return self._limit_length(result, max_answer_chars)
 
 
