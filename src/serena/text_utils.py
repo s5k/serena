@@ -3,7 +3,9 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any, Self
 
+from joblib import Parallel, delayed
 from pathspec import PathSpec
 from pathspec.patterns.gitwildmatch import GitWildMatchPattern
 
@@ -36,11 +38,16 @@ class TextLine:
             return "  >"
         return "..."
 
-    def format_line(self) -> str:
-        """Format the line for display with line number and content."""
+    def format_line(self, include_line_numbers: bool = True) -> str:
+        """Format the line for display (e.g.,for logging or passing to an LLM).
+
+        :param include_line_numbers: Whether to include the line number in the result.
+        """
         prefix = self.get_display_prefix()
-        line_num = str(self.line_number).rjust(4)
-        return f"{prefix}{line_num}: {self.line_content}"
+        if include_line_numbers:
+            line_num = str(self.line_number).rjust(4)
+            prefix = f"{prefix}{line_num}"
+        return f"{prefix}:{self.line_content}"
 
 
 @dataclass(kw_only=True)
@@ -50,7 +57,7 @@ class MatchedConsecutiveLines:
     """
 
     lines: list[TextLine]
-    """All lines in the context of the match. At least one of them should be of match_type MATCH."""
+    """All lines in the context of the match. At least one of them is of `match_type` `MATCH`."""
     source_file_path: str | None = None
     """Path to the file where the match was found (Metadata)."""
 
@@ -82,8 +89,27 @@ class MatchedConsecutiveLines:
     def num_matched_lines(self) -> int:
         return len(self.matched_lines)
 
-    def to_display_string(self) -> str:
-        return "\n".join([line.format_line() for line in self.lines])
+    def to_display_string(self, include_line_numbers: bool = True) -> str:
+        return "\n".join([line.format_line(include_line_numbers) for line in self.lines])
+
+    @classmethod
+    def from_file_contents(
+        cls, file_contents: str, line: int, context_lines_before: int = 0, context_lines_after: int = 0, source_file_path: str | None = None
+    ) -> Self:
+        line_contents = file_contents.split("\n")
+        start_lineno = max(0, line - context_lines_before)
+        end_lineno = min(len(line_contents) - 1, line + context_lines_after)
+        text_lines: list[TextLine] = []
+        # before the line
+        for lineno in range(start_lineno, line):
+            text_lines.append(TextLine(line_number=lineno, line_content=line_contents[lineno], match_type=LineType.BEFORE_MATCH))
+        # the line
+        text_lines.append(TextLine(line_number=line, line_content=line_contents[line], match_type=LineType.MATCH))
+        # after the line
+        for lineno in range(line + 1, end_lineno + 1):
+            text_lines.append(TextLine(line_number=lineno, line_content=line_contents[lineno], match_type=LineType.AFTER_MATCH))
+
+        return cls(lines=text_lines, source_file_path=source_file_path)
 
 
 def search_text(
@@ -103,7 +129,8 @@ def search_text(
         content: The text content to search. May be None if source_file_path is provided.
         source_file_path: Optional path to the source file. If content is None,
             this has to be passed and the file will be read.
-        allow_multiline_match: Whether to search across multiple lines
+        allow_multiline_match: Whether to search across multiple lines. Currently, the default
+            option (False) is very inefficient, so it is recommended to set this to True.
         context_lines_before: Number of context lines to include before matches
         context_lines_after: Number of context lines to include after matches
         is_glob: If True, pattern is treated as a glob-like pattern (e.g., "*.py", "test_??.py")
@@ -188,6 +215,8 @@ def search_text(
 
             matches.append(MatchedConsecutiveLines(lines=context_lines, source_file_path=source_file_path))
     else:
+        # TODO: extremely inefficient! Since we currently don't use this option in SerenaAgent or LanguageServer,
+        #   it is not urgent to fix, but should be either improved or the option should be removed.
         # Search line by line
         for i, line in enumerate(lines):
             line_num = i + 1
@@ -242,10 +271,11 @@ def search_files(
     :param paths_exclude_glob: Optional glob pattern to exclude files from the list
     :return: List of MatchedConsecutiveLines objects
     """
-    matches = []
+    # Pre-filter paths (done sequentially to avoid overhead)
     include_spec = PathSpec.from_lines(GitWildMatchPattern, [paths_include_glob]) if paths_include_glob else None
     exclude_spec = PathSpec.from_lines(GitWildMatchPattern, [paths_exclude_glob]) if paths_exclude_glob else None
-    skipped_file_error_tuples: list[tuple[str, str]] = []
+
+    filtered_paths = []
     for path in file_paths:
         if include_spec and not include_spec.match_file(path):
             log.debug(f"Skipping {path}: does not match include pattern {paths_include_glob}")
@@ -253,26 +283,47 @@ def search_files(
         if exclude_spec and exclude_spec.match_file(path):
             log.debug(f"Skipping {path}: matches exclude pattern {paths_exclude_glob}")
             continue
+        filtered_paths.append(path)
+
+    log.info(f"Processing {len(filtered_paths)} files.")
+
+    def process_single_file(path: str) -> dict[str, Any]:
+        """Process a single file - this function will be parallelized."""
         try:
             file_content = file_reader(path)
+            search_results = search_text(
+                pattern,
+                content=file_content,
+                source_file_path=path,
+                allow_multiline_match=True,
+                context_lines_before=context_lines_before,
+                context_lines_after=context_lines_after,
+            )
+            if len(search_results) > 0:
+                log.debug(f"Found {len(search_results)} matches in {path}")
+            return {"path": path, "results": search_results, "error": None}
         except Exception as e:
-            skipped_file_error_tuples.append((path, str(e)))
-            continue
+            log.debug(f"Error processing {path}: {e}")
+            return {"path": path, "results": [], "error": str(e)}
 
-        search_results = search_text(
-            pattern,
-            file_content,
-            source_file_path=path,
-            allow_multiline_match=True,
-            context_lines_before=context_lines_before,
-            context_lines_after=context_lines_after,
-        )
-        if len(search_results) > 0:
-            log.debug(f"Found {len(search_results)} matches in {path}")
-            matches.extend(search_results)
+    # Execute in parallel using joblib
+    results = Parallel(
+        n_jobs=-1,
+        backend="threading",
+    )(delayed(process_single_file)(path) for path in filtered_paths)
+
+    # Collect results and errors
+    matches = []
+    skipped_file_error_tuples = []
+
+    for result in results:
+        if result["error"]:
+            skipped_file_error_tuples.append((result["path"], result["error"]))
+        else:
+            matches.extend(result["results"])
+
     if skipped_file_error_tuples:
-        log.debug(
-            f"Failed to read {len(skipped_file_error_tuples)} files. Here the full list of files and errors:\n{skipped_file_error_tuples}"
-        )
+        log.debug(f"Failed to read {len(skipped_file_error_tuples)} files: {skipped_file_error_tuples}")
 
+    log.info(f"Found {len(matches)} total matches across {len(filtered_paths)} files")
     return matches

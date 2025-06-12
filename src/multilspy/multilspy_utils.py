@@ -57,7 +57,7 @@ class TextUtils:
         return idx
     
     @staticmethod
-    def get_updated_position_from_line_and_column_and_edit(l: int, c: int, text_to_be_inserted: str) -> Tuple[int, int]:
+    def _get_updated_position_from_line_and_column_and_edit(l: int, c: int, text_to_be_inserted: str) -> Tuple[int, int]:
         """
         Utility function to get the position of the cursor after inserting text at a given line and column.
         """
@@ -68,6 +68,30 @@ class TextUtils:
         else:
             c += len(text_to_be_inserted)
         return (l, c)
+    
+    @staticmethod
+    def delete_text_between_positions(text: str, start_line: int, start_col: int, end_line: int, end_col: int) -> Tuple[str, str]:
+        """
+        Deletes the text between the given start and end positions.
+        Returns the modified text and the deleted text.
+        """
+        del_start_idx = TextUtils.get_index_from_line_col(text, start_line, start_col)
+        del_end_idx = TextUtils.get_index_from_line_col(text, end_line, end_col)
+        
+        deleted_text = text[del_start_idx:del_end_idx]
+        new_text = text[:del_start_idx] + text[del_end_idx:]
+        return new_text, deleted_text
+    
+    @staticmethod
+    def insert_text_at_position(text: str, line: int, col: int, text_to_be_inserted: str) -> Tuple[str, int, int]:
+        """
+        Inserts the given text at the given line and column.
+        Returns the modified text and the new line and column.
+        """
+        change_index = TextUtils.get_index_from_line_col(text, line, col)
+        new_text = text[:change_index] + text_to_be_inserted + text[change_index:]
+        new_l, new_c = TextUtils._get_updated_position_from_line_and_column_and_edit(line, col, text_to_be_inserted)
+        return new_text, new_l, new_c
 
 
 class PathUtils:
@@ -128,22 +152,12 @@ class FileUtils:
         if not os.path.exists(file_path):
             logger.log(f"File read '{file_path}' failed: File does not exist.", logging.ERROR)
             raise MultilspyException(f"File read '{file_path}' failed: File does not exist.")
-        encodings = ["utf-8-sig", "utf-16", "utf-8", "latin-1"]
         try:
-            for encoding in encodings:
-                try:
-                    with open(file_path, "r", encoding=encoding) as inp_file:
-                        return inp_file.read()
-                except UnicodeError:
-                    continue
-            # Try system default encoding as a last resort
-            with open(file_path, "r") as inp_file:
+            with open(file_path, "r", encoding="utf-8") as inp_file:
                 return inp_file.read()
         except Exception as exc:
-            logger.log(f"File read '{file_path}' failed: {exc}", logging.ERROR)
+            logger.log(f"File read '{file_path}' failed to read with encoding 'utf-8': {exc}", logging.ERROR)
             raise MultilspyException("File read failed.") from None
-        logger.log(f"File read '{file_path}' failed: Unsupported encoding.", logging.ERROR)
-        raise MultilspyException(f"File read '{file_path}' failed: Unsupported encoding.") from None
     
     @staticmethod
     def download_file(logger: MultilspyLogger, url: str, target_path: str) -> None:
@@ -299,29 +313,38 @@ class PlatformUtils:
         """
         try:
             result = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, check=True)
-            version = ''
+            available_version_cmd_output = []
             for line in result.stdout.decode('utf-8').split('\n'):
                 if line.startswith('Microsoft.NETCore.App'):
-                    version = line.split(' ')[1]
-                    break
-            if version == '':
+                    version_cmd_output = line.split(' ')[1]
+                    available_version_cmd_output.append(version_cmd_output)
+            
+            if not available_version_cmd_output:
                 raise MultilspyException("dotnet not found on the system")
-            if version.startswith("8"):
-                return DotnetVersion.V8
-            elif version.startswith("7"):
-                return DotnetVersion.V7
-            elif version.startswith("6"):
-                return DotnetVersion.V6
-            elif version.startswith("4"):
-                return DotnetVersion.V4
-            else:
-                raise MultilspyException("Unknown dotnet version: " + version)
+            
+            # Check for supported versions in order of preference (latest first)
+            for version_cmd_output in available_version_cmd_output:
+                if version_cmd_output.startswith("8"):
+                    return DotnetVersion.V8
+            for version_cmd_output in available_version_cmd_output:
+                if version_cmd_output.startswith("7"):
+                    return DotnetVersion.V7
+            for version_cmd_output in available_version_cmd_output:
+                if version_cmd_output.startswith("6"):
+                    return DotnetVersion.V6
+            for version_cmd_output in available_version_cmd_output:
+                if version_cmd_output.startswith("4"):
+                    return DotnetVersion.V4
+            
+            # If no supported version found, raise exception with all available versions
+            raise MultilspyException(f"No supported dotnet version found. Available versions: {', '.join(available_version_cmd_output)}. Supported versions: 4, 6, 7, 8")
         except (FileNotFoundError, subprocess.CalledProcessError):
             try:
                 result = subprocess.run(["mono", "--version"], capture_output=True, check=True)
                 return DotnetVersion.VMONO
             except (FileNotFoundError, subprocess.CalledProcessError):
                 raise MultilspyException("dotnet or mono not found on the system")
+
 
 
 class SymbolUtils:
